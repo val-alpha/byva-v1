@@ -23,6 +23,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Apply rustfmt and export canonical source
+        shell: bash
+        run: |
+          cargo fmt --all
+          for file in crates/tokenizer/src/lib.rs crates/tokenizer/tests/golden.rs crates/format/src/lib.rs crates/format/tests/golden.rs; do
+            echo "RUSTFMT_BEGIN:$file"
+            base64 -w0 "$file"
+            echo
+            echo "RUSTFMT_END:$file"
+          done
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check workspace
