@@ -5,10 +5,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use byva_tokenizer::{BYTE_TOKEN_BASE, SpecialToken as S, TokenId, Tokenizer, TokenizerError};
+use byva_tokenizer::{SpecialToken as S, TokenId, Tokenizer, TokenizerError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+mod untrusted;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -412,6 +414,14 @@ impl StreamingParser {
         if let Some(special) = S::from_id(token) {
             self.handle_special(special, &mut events);
         } else {
+            if token.0 < byva_tokenizer::BYTE_TOKEN_BASE {
+                self.fail("invalid control-token ID", &mut events);
+                return events;
+            }
+            if token.0 >= tokenizer.vocab_size() {
+                self.fail("content token ID is outside the tokenizer vocabulary", &mut events);
+                return events;
+            }
             self.call_stop_seen = false;
             match self.state {
                 ParseState::CallJson => match tokenizer.token_bytes(token) {
@@ -520,7 +530,9 @@ impl StreamingParser {
                     );
                 } else {
                     self.flush_text(true, events);
-                    self.channel = Channel::Think;
+                    if self.state != ParseState::Failed {
+                        self.channel = Channel::Think;
+                    }
                 }
             }
             S::EndThink => {
@@ -528,7 +540,9 @@ impl StreamingParser {
                     self.fail("unmatched </think> token", events);
                 } else {
                     self.flush_text(true, events);
-                    self.channel = Channel::Text;
+                    if self.state != ParseState::Failed {
+                        self.channel = Channel::Text;
+                    }
                 }
             }
             S::Call => {
@@ -539,10 +553,12 @@ impl StreamingParser {
                     );
                 } else {
                     self.flush_text(true, events);
-                    self.call_bytes.clear();
-                    self.state = ParseState::CallJson;
-                    self.call_stop_seen = false;
-                    events.push(ParseEvent::CallStarted);
+                    if self.state != ParseState::Failed {
+                        self.call_bytes.clear();
+                        self.state = ParseState::CallJson;
+                        self.call_stop_seen = false;
+                        events.push(ParseEvent::CallStarted);
+                    }
                 }
             }
             S::End => {
@@ -813,6 +829,86 @@ mod tests {
     }
 
     #[test]
+    fn parallel_calls_can_be_completed_out_of_order() {
+        let tokenizer = tokenizer();
+        let tools = vec![
+            tool(),
+            ToolDefinition {
+                name: "peta".to_owned(),
+                description: "Map lookup".to_owned(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        ];
+        let conversation = Conversation::new(
+            vec![
+                Message::system("tools available"),
+                Message::assistant(
+                    vec![
+                        AssistantPart::Call(ToolCall {
+                            id: "c1".to_owned(),
+                            name: "cuaca".to_owned(),
+                            args: serde_json::json!({}),
+                        }),
+                        AssistantPart::Call(ToolCall {
+                            id: "c2".to_owned(),
+                            name: "peta".to_owned(),
+                            args: serde_json::json!({}),
+                        }),
+                    ],
+                    false,
+                ),
+                Message::tool_result(ToolResult {
+                    id: "c2".to_owned(),
+                    data: Some(serde_json::json!({"ok":true})),
+                    error: None,
+                }),
+                Message::tool_result(ToolResult {
+                    id: "c1".to_owned(),
+                    data: Some(serde_json::json!({"ok":true})),
+                    error: None,
+                }),
+                Message::assistant(vec![AssistantPart::Text("done".to_owned())], true),
+            ],
+            tools,
+        );
+        let tokens = Renderer::default()
+            .render(&conversation, &tokenizer)
+            .expect("parallel calls render");
+        let mut parser = StreamingParser::default();
+        let mut events = Vec::new();
+        for token in tokens {
+            events.extend(parser.push(token, &tokenizer));
+        }
+        events.extend(parser.finish());
+        let calls: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                ParseEvent::CallComplete { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, vec!["c1", "c2"]);
+    }
+
+    #[test]
+    fn parser_rejects_control_ids_from_untrusted_sources() {
+        let tokenizer = tokenizer();
+        let mut parser = StreamingParser::default();
+        let events = parser.push_untrusted_token(S::Call.id(), &tokenizer);
+        assert!(events.iter().any(|event| matches!(event, ParseEvent::ParseError(_))));
+    }
+
+    #[test]
+    fn untrusted_marker_looking_text_is_plain_content() {
+        let tokenizer = tokenizer();
+        let mut parser = StreamingParser::default();
+        let mut events = parser.push(S::Assistant.id(), &tokenizer);
+        events.extend(parser.push_untrusted_text("literal <|call|>", &tokenizer));
+        assert!(events.iter().any(|event| matches!(event, ParseEvent::TextDelta(text) if text == "literal <|call|>")));
+        assert!(!events.iter().any(|event| matches!(event, ParseEvent::CallStarted)));
+    }
+
+    #[test]
     fn rendered_token_looking_user_text_is_not_control() {
         let tokenizer = tokenizer();
         let conversation =
@@ -889,13 +985,9 @@ mod tests {
                 events.extend(parser.push(*token, &tokenizer));
             }
             events.extend(parser.finish());
-            // A truncated prefix is either explicitly rejected or ends at a complete call stop.
-            assert!(
-                events
-                    .iter()
-                    .all(|event| !matches!(event, ParseEvent::ParseError(_)))
-                    || end < complete.len()
-            );
+            if end + 1 == complete.len() {
+                assert!(events.iter().any(|event| matches!(event, ParseEvent::ParseError(_))));
+            }
         }
     }
 
@@ -940,14 +1032,23 @@ mod tests {
 
     proptest::proptest! {
         #[test]
-        fn content_round_trip_does_not_create_control_tokens(s in proptest::string::string_regex(".{0,80}").expect("valid regex")) {
+        fn renderer_keeps_marker_looking_user_text_as_content(
+            input in proptest::string::string_regex(".{0,80}").expect("valid regex")
+        ) {
             let tokenizer = tokenizer();
-            let conversation = Conversation::new(vec![Message::user(s.clone())], vec![]);
+            let conversation = Conversation::new(vec![Message::user(input)], vec![]);
             let rendered = Renderer::default().render(&conversation, &tokenizer);
-            prop_assert!(rendered.is_ok());
+            proptest::prop_assert!(rendered.is_ok());
             let rendered = rendered.unwrap_or_default();
-            prop_assert!(rendered.iter().filter(|id| id.0 >= BYTE_TOKEN_BASE).count() >= 0);
-            prop_assert!(!rendered.iter().any(|id| *id == S::Call.id() && !s.contains("<|call|>")));
+            let controls: Vec<TokenId> = rendered
+                .iter()
+                .copied()
+                .filter(|id| S::from_id(*id).is_some())
+                .collect();
+            proptest::prop_assert_eq!(
+                controls,
+                vec![S::Bos.id(), S::User.id(), S::End.id()]
+            );
         }
     }
 }
