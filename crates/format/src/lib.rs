@@ -747,7 +747,7 @@ pub fn events_to_openai(events: &[ParseEvent]) -> Result<OpenAiAssistantOutput, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use byva_tokenizer::{BYTE_TOKEN_BASE, FIRST_MERGE_ID, Merge};
+    use byva_tokenizer::{BYTE_TOKEN_BASE, Merge};
 
     fn tokenizer() -> Tokenizer {
         Tokenizer::from_merges(
@@ -1027,7 +1027,6 @@ mod tests {
         let tokenizer = tokenizer();
         let encoded = tokenizer.encode_content("<|result|>");
         assert!(encoded.iter().all(|token| token.0 >= BYTE_TOKEN_BASE));
-        assert!(FIRST_MERGE_ID > BYTE_TOKEN_BASE);
     }
 
     proptest::proptest! {
