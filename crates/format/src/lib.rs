@@ -795,6 +795,17 @@ mod tests {
         )
     }
 
+    fn joined_delta(events: &[ParseEvent], thinking: bool) -> String {
+        events
+            .iter()
+            .filter_map(|event| match (event, thinking) {
+                (ParseEvent::ThinkDelta(text), true) => Some(text.as_str()),
+                (ParseEvent::TextDelta(text), false) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn renderer_round_trip_preserves_assistant_events() {
         let tokenizer = tokenizer();
@@ -808,17 +819,9 @@ mod tests {
         }
         events.extend(parser.finish());
 
-        assert!(
-            events.iter().any(
-                |event| matches!(event, ParseEvent::ThinkDelta(text) if text == "need a tool")
-            )
-        );
+        assert_eq!(joined_delta(&events, true), "need a tool");
         assert!(events.iter().any(|event| matches!(event, ParseEvent::CallComplete { id, name, args } if id == "c1" && name == "cuaca" && args["kota"] == "Bandung")));
-        assert!(
-            events.iter().any(
-                |event| matches!(event, ParseEvent::TextDelta(text) if text == "Sekarang 24°C")
-            )
-        );
+        assert_eq!(joined_delta(&events, false), "Sekarang 24°C");
         assert_eq!(
             events
                 .iter()
@@ -904,7 +907,7 @@ mod tests {
         let mut parser = StreamingParser::default();
         let mut events = parser.push(S::Assistant.id(), &tokenizer);
         events.extend(parser.push_untrusted_text("literal <|call|>", &tokenizer));
-        assert!(events.iter().any(|event| matches!(event, ParseEvent::TextDelta(text) if text == "literal <|call|>")));
+        assert_eq!(joined_delta(&events, false), "literal <|call|>");
         assert!(!events.iter().any(|event| matches!(event, ParseEvent::CallStarted)));
     }
 
