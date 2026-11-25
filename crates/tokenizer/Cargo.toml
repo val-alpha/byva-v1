@@ -6,5 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[dependencies]
+thiserror.workspace = true
+unicode-normalization = "0.1"
+serde.workspace = true
+
+[dev-dependencies]
+proptest = "1.6"
+serde_json.workspace = true
+
 [lints]
 workspace = true

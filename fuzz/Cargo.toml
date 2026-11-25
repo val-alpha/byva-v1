@@ -1,0 +1,30 @@
+[package]
+name = "byva-format-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+byva-tokenizer = { path = "../crates/tokenizer" }
+byva-format = { path = "../crates/format" }
+
+[[bin]]
+name = "stream_parser"
+path = "fuzz_targets/stream_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenizer_round_trip"
+path = "fuzz_targets/tokenizer_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
