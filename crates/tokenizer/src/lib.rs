@@ -295,8 +295,7 @@ impl Tokenizer {
             })
             .collect();
 
-        let mut queue: BinaryHeap<Reverse<(u32, usize, usize, u64, u64)>> =
-            BinaryHeap::new();
+        let mut queue: MergeQueue = BinaryHeap::new();
         for left in 0..nodes.len().saturating_sub(1) {
             Self::queue_pair(left, &nodes, &self.merge_by_pair, &mut queue);
         }
