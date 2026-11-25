@@ -44,6 +44,8 @@ jobs:
           base64 -w0 Cargo.lock
           echo
           echo "CARGO_LOCK_END"
+      - name: Check fuzz target
+        run: cargo check --manifest-path fuzz/Cargo.toml
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests
