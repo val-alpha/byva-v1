@@ -808,17 +808,23 @@ mod tests {
         }
         events.extend(parser.finish());
 
-        assert!(
-            events.iter().any(
-                |event| matches!(event, ParseEvent::ThinkDelta(text) if text == "need a tool")
-            )
-        );
+        let think_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ParseEvent::ThinkDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(think_text, "need a tool");
         assert!(events.iter().any(|event| matches!(event, ParseEvent::CallComplete { id, name, args } if id == "c1" && name == "cuaca" && args["kota"] == "Bandung")));
-        assert!(
-            events.iter().any(
-                |event| matches!(event, ParseEvent::TextDelta(text) if text == "Sekarang 24°C")
-            )
-        );
+        let assistant_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ParseEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistant_text, "Sekarang 24°C");
         assert_eq!(
             events
                 .iter()
@@ -904,7 +910,14 @@ mod tests {
         let mut parser = StreamingParser::default();
         let mut events = parser.push(S::Assistant.id(), &tokenizer);
         events.extend(parser.push_untrusted_text("literal <|call|>", &tokenizer));
-        assert!(events.iter().any(|event| matches!(event, ParseEvent::TextDelta(text) if text == "literal <|call|>")));
+        let plain_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ParseEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(plain_text, "literal <|call|>");
         assert!(!events.iter().any(|event| matches!(event, ParseEvent::CallStarted)));
     }
 
