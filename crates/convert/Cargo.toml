@@ -1,0 +1,10 @@
+[package]
+name = "byva-convert"
+version = "0.1.0"
+description = "Conversion tools for the BYVA native checkpoint format"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

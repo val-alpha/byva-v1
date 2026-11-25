@@ -1,0 +1,10 @@
+[package]
+name = "byva-format"
+version = "0.1.0"
+description = "BYVA conversation format, renderer, and streaming parser"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

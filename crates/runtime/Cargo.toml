@@ -1,0 +1,10 @@
+[package]
+name = "byva-runtime"
+version = "0.1.0"
+description = "Native Rust inference runtime for BYVA"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

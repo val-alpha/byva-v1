@@ -1,0 +1,10 @@
+[package]
+name = "byva-cli"
+version = "0.1.0"
+description = "Command-line interface for BYVA"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

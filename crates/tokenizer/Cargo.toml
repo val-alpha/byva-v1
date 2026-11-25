@@ -1,0 +1,10 @@
+[package]
+name = "byva-tokenizer"
+version = "0.1.0"
+description = "Deterministic byte-level BPE tokenizer for BYVA"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
