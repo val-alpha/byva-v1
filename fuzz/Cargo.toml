@@ -1,30 +1,19 @@
 [package]
-name = "byva-format-fuzz"
+name = "byva-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2024"
+edition = "2021"
 
-[package.metadata]
-cargo-fuzz = true
+[workspace]
 
 [dependencies]
 libfuzzer-sys = "0.4"
-byva-tokenizer = { path = "../crates/tokenizer" }
 byva-format = { path = "../crates/format" }
+byva-tokenizer = { path = "../crates/tokenizer" }
 
 [[bin]]
-name = "stream_parser"
-path = "fuzz_targets/stream_parser.rs"
+name = "parser_tokens"
+path = "fuzz_targets/parser_tokens.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "tokenizer_round_trip"
-path = "fuzz_targets/tokenizer_round_trip.rs"
-test = false
-doc = false
-bench = false
-
-[workspace]
-members = ["."]

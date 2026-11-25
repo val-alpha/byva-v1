@@ -127,3 +127,15 @@ The conversion layer does not execute tools. Dispatch, authorization, timeout po
 ## 8. Training serialization contract
 
 The renderer's typed output is the canonical input representation for later training conversion. The planned loss mask is applied to model-authored tokens only: assistant think/text/call contents and the assistant control markers think, /think, call, /call, and end. System and user content, role headers, tool headers, and complete tool/result payloads are masked. The training implementation is introduced in the pretraining/SFT phases; this document defines the format contract only.
+
+
+## 9. Fuzzing
+
+The standalone cargo-fuzz package under `fuzz/` exercises the streaming parser with arbitrary 32-bit token IDs and truncated token streams. Run it with:
+
+~~~sh
+cargo install cargo-fuzz
+cargo fuzz run parser_tokens
+~~~
+
+The fuzz target deliberately uses a minimal valid tokenizer vocabulary, so malformed IDs, unexpected control markers, and incomplete protocol prefixes are exercised without requiring a trained BPE merge table. Keep regression inputs under `fuzz/corpus/parser_tokens/` when a crash or invariant violation is found.
