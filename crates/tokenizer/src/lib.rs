@@ -172,9 +172,9 @@ struct MergeEntry {
     output: TokenId,
 }
 
-#[derive(Debug, Clone)]
 type MergeQueue = BinaryHeap<Reverse<(u32, usize, usize, u64, u64)>>;
 
+#[derive(Debug, Clone)]
 struct Node {
     token: TokenId,
     previous: Option<usize>,
