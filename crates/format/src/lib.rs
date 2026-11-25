@@ -5,9 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use byva_tokenizer::{
-    SpecialToken as S, TokenId, Tokenizer, TokenizerError, BYTE_TOKEN_BASE,
-};
+use byva_tokenizer::{BYTE_TOKEN_BASE, SpecialToken as S, TokenId, Tokenizer, TokenizerError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -213,9 +211,9 @@ impl Renderer {
                     self.append_text(&mut output, content, tokenizer)?;
                     if !conversation.tools.is_empty() && !tools_written {
                         output.push(S::Tools.id());
-                        output.extend(tokenizer.encode_content(&serde_json::to_string(
-                            &conversation.tools,
-                        )?));
+                        output.extend(
+                            tokenizer.encode_content(&serde_json::to_string(&conversation.tools)?),
+                        );
                         output.push(S::EndTools.id());
                         tools_written = true;
                     }
@@ -272,13 +270,15 @@ impl Renderer {
                         || result.data.is_some() == result.error.is_some()
                         || !outstanding_calls.remove(&result.id)
                     {
-                        return Err(if result.id.is_empty()
-                            || result.data.is_some() == result.error.is_some()
-                        {
-                            FormatError::InvalidToolResult
-                        } else {
-                            FormatError::UnmatchedToolResult(result.id.clone())
-                        });
+                        return Err(
+                            if result.id.is_empty()
+                                || result.data.is_some() == result.error.is_some()
+                            {
+                                FormatError::InvalidToolResult
+                            } else {
+                                FormatError::UnmatchedToolResult(result.id.clone())
+                            },
+                        );
                     }
                     output.push(S::Tool.id());
                     output.push(S::Result.id());
@@ -400,7 +400,9 @@ impl StreamingParser {
     pub fn push(&mut self, token: TokenId, tokenizer: &Tokenizer) -> Vec<ParseEvent> {
         let mut events = Vec::new();
         if self.state == ParseState::Finished {
-            events.push(ParseEvent::ParseError("token received after parser finish".to_owned()));
+            events.push(ParseEvent::ParseError(
+                "token received after parser finish".to_owned(),
+            ));
             return events;
         }
         if self.state == ParseState::Failed {
@@ -454,7 +456,10 @@ impl StreamingParser {
         } else if self.role == Some(Role::Assistant) && !self.call_stop_seen {
             self.flush_text(true, &mut events);
             if self.state != ParseState::Failed {
-                self.fail("assistant stream ended before <|end|> or <|/call|>", &mut events);
+                self.fail(
+                    "assistant stream ended before <|end|> or <|/call|>",
+                    &mut events,
+                );
             }
         } else {
             self.flush_text(true, &mut events);
@@ -489,7 +494,10 @@ impl StreamingParser {
                     self.state = ParseState::Message;
                     self.role = None;
                 } else {
-                    self.fail("unexpected control token inside tool result JSON block", events);
+                    self.fail(
+                        "unexpected control token inside tool result JSON block",
+                        events,
+                    );
                 }
                 return;
             }
@@ -506,7 +514,10 @@ impl StreamingParser {
             S::Tool => self.start_role(Role::Tool, events),
             S::Think => {
                 if self.role != Some(Role::Assistant) || self.channel == Channel::Think {
-                    self.fail("think block is not valid in the current parser state", events);
+                    self.fail(
+                        "think block is not valid in the current parser state",
+                        events,
+                    );
                 } else {
                     self.flush_text(true, events);
                     self.channel = Channel::Think;
@@ -522,7 +533,10 @@ impl StreamingParser {
             }
             S::Call => {
                 if self.role != Some(Role::Assistant) {
-                    self.fail("tool call is only valid inside an assistant message", events);
+                    self.fail(
+                        "tool call is only valid inside an assistant message",
+                        events,
+                    );
                 } else {
                     self.flush_text(true, events);
                     self.call_bytes.clear();
@@ -560,9 +574,10 @@ impl StreamingParser {
             S::EndCall => self.fail("unmatched </call> token", events),
             S::EndTools => self.fail("unmatched </tools> token", events),
             S::EndResult => self.fail("unmatched </result> token", events),
-            S::Reserved(index) => {
-                self.fail(&format!("reserved control token {index} is not valid here"), events)
-            }
+            S::Reserved(index) => self.fail(
+                &format!("reserved control token {index} is not valid here"),
+                events,
+            ),
         }
     }
 
@@ -716,7 +731,7 @@ pub fn events_to_openai(events: &[ParseEvent]) -> Result<OpenAiAssistantOutput, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use byva_tokenizer::{Merge, BYTE_TOKEN_BASE, FIRST_MERGE_ID};
+    use byva_tokenizer::{BYTE_TOKEN_BASE, FIRST_MERGE_ID, Merge};
 
     fn tokenizer() -> Tokenizer {
         Tokenizer::from_merges(
@@ -777,19 +792,31 @@ mod tests {
         }
         events.extend(parser.finish());
 
-        assert!(events.iter().any(|event| matches!(event, ParseEvent::ThinkDelta(text) if text == "need a tool")));
+        assert!(
+            events.iter().any(
+                |event| matches!(event, ParseEvent::ThinkDelta(text) if text == "need a tool")
+            )
+        );
         assert!(events.iter().any(|event| matches!(event, ParseEvent::CallComplete { id, name, args } if id == "c1" && name == "cuaca" && args["kota"] == "Bandung")));
-        assert!(events.iter().any(|event| matches!(event, ParseEvent::TextDelta(text) if text == "Sekarang 24°C")));
-        assert_eq!(events.iter().filter(|event| **event == ParseEvent::TurnEnd).count(), 1);
+        assert!(
+            events.iter().any(
+                |event| matches!(event, ParseEvent::TextDelta(text) if text == "Sekarang 24°C")
+            )
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == ParseEvent::TurnEnd)
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn rendered_token_looking_user_text_is_not_control() {
         let tokenizer = tokenizer();
-        let conversation = Conversation::new(
-            vec![Message::user("please print <|call|> exactly")],
-            vec![],
-        );
+        let conversation =
+            Conversation::new(vec![Message::user("please print <|call|> exactly")], vec![]);
         let tokens = Renderer::default()
             .render(&conversation, &tokenizer)
             .expect("token-like content is encoded as text");
@@ -813,10 +840,7 @@ mod tests {
         let tokenizer = tokenizer();
         let mut parser = StreamingParser::default();
         let mut events = Vec::new();
-        for token in [
-            S::Assistant.id(),
-            S::Call.id(),
-        ] {
+        for token in [S::Assistant.id(), S::Call.id()] {
             events.extend(parser.push(token, &tokenizer));
         }
         for byte in br#"{"id":"same","name":"cuaca","args":{}}"# {
@@ -828,7 +852,11 @@ mod tests {
             events.extend(parser.push(TokenId(BYTE_TOKEN_BASE + u32::from(*byte)), &tokenizer));
         }
         events.extend(parser.push(S::EndCall.id(), &tokenizer));
-        assert!(events.iter().any(|event| matches!(event, ParseEvent::ParseError(_))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ParseEvent::ParseError(_)))
+        );
     }
 
     #[test]
@@ -841,7 +869,11 @@ mod tests {
             events.extend(parser.push(TokenId(BYTE_TOKEN_BASE + u32::from(*byte)), &tokenizer));
         }
         events.extend(parser.push(S::EndCall.id(), &tokenizer));
-        assert!(events.iter().any(|event| matches!(event, ParseEvent::ParseError(_))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ParseEvent::ParseError(_)))
+        );
     }
 
     #[test]
@@ -858,7 +890,12 @@ mod tests {
             }
             events.extend(parser.finish());
             // A truncated prefix is either explicitly rejected or ends at a complete call stop.
-            assert!(events.iter().all(|event| !matches!(event, ParseEvent::ParseError(_))) || end < complete.len());
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event, ParseEvent::ParseError(_)))
+                    || end < complete.len()
+            );
         }
     }
 
@@ -871,18 +908,20 @@ mod tests {
         for byte in b"12345" {
             events.extend(parser.push(TokenId(BYTE_TOKEN_BASE + u32::from(*byte)), &tokenizer));
         }
-        assert!(events.iter().any(|event| matches!(event, ParseEvent::ParseError(_))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ParseEvent::ParseError(_)))
+        );
     }
 
     #[test]
     fn openai_converter_emits_tool_call_shape() {
-        let events = vec![
-            ParseEvent::CallComplete {
-                id: "c1".to_owned(),
-                name: "cuaca".to_owned(),
-                args: serde_json::json!({"kota":"Bandung"}),
-            },
-        ];
+        let events = vec![ParseEvent::CallComplete {
+            id: "c1".to_owned(),
+            name: "cuaca".to_owned(),
+            args: serde_json::json!({"kota":"Bandung"}),
+        }];
         let converted = events_to_openai(&events).expect("valid events");
         let json = serde_json::to_value(converted).expect("serializable");
         assert_eq!(json["tool_calls"][0]["id"], "c1");

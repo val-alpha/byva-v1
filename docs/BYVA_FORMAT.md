@@ -89,6 +89,8 @@ The default token-like content policy is EncodeAsText. A string such as the lite
 
 The renderer starts a conversation with <|bos|>. System and user messages end with <|end|>. Assistant messages end only when the caller marks the turn complete. Tool results use the dedicated tool/result markers. Tool definitions are serialized as compact JSON and placed inside the single system message.
 
+Renderer rejects tool calls whose names are absent from the system tool list, duplicate/empty call IDs, unmatched result IDs, and invalid result envelopes. It permits outstanding calls at the end of a prompt because the next operation may be tool execution.
+
 ## 6. Streaming parser
 
 StreamingParser consumes token IDs incrementally. It has explicit states for ordinary message content, call JSON, ignored tools JSON, ignored tool-result JSON, failed input, and finished input. It does not search decoded strings for control markers.
@@ -108,7 +110,9 @@ Text bytes are buffered across token boundaries so a multi-byte UTF-8 character 
 
 Call/result tool output is not surfaced as assistant text. Tool definitions and result payloads are skipped as structured context. A successful call close is a valid generation stop point; finish() accepts that boundary. Other incomplete assistant messages or open blocks produce ParseError rather than panic. After a parse error the parser enters a failed state and ignores further input.
 
-The parser expects renderer/model token IDs. External untrusted text must first be encoded with Tokenizer::encode_content; never construct control IDs by parsing untrusted marker-looking text.
+For untrusted data, use push_untrusted_token or push_untrusted_text. The token API rejects every ID below the byte-token range, including control and reserved IDs. The text API always encodes external text as content first, so a string such as <|call|> remains ordinary text. Never construct control IDs by parsing untrusted marker-looking text.
+
+The parser expects model/renderer token IDs for trusted protocol structure. Untrusted text must enter through the explicit untrusted APIs or the typed renderer.
 
 ## 7. OpenAI-style conversion
 

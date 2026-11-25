@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           cargo fmt --all
-          for file in crates/tokenizer/src/lib.rs crates/tokenizer/tests/golden.rs crates/format/src/lib.rs crates/format/tests/golden.rs; do
+          for file in crates/tokenizer/src/lib.rs crates/tokenizer/tests/golden.rs crates/format/src/lib.rs crates/format/src/untrusted.rs crates/format/tests/golden.rs; do
             echo "RUSTFMT_BEGIN:$file"
             base64 -w0 "$file"
             echo
@@ -37,6 +37,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check workspace
         run: cargo check --workspace --all-targets
+      - name: Export generated lockfile
+        shell: bash
+        run: |
+          echo "CARGO_LOCK_BEGIN"
+          base64 -w0 Cargo.lock
+          echo
+          echo "CARGO_LOCK_END"
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests
