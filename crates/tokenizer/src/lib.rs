@@ -173,6 +173,8 @@ struct MergeEntry {
 }
 
 #[derive(Debug, Clone)]
+type MergeQueue = BinaryHeap<Reverse<(u32, usize, usize, u64, u64)>>;
+
 struct Node {
     token: TokenId,
     previous: Option<usize>,
@@ -364,7 +366,7 @@ impl Tokenizer {
         left: usize,
         nodes: &[Node],
         merges: &HashMap<(u32, u32), MergeEntry>,
-        queue: &mut BinaryHeap<Reverse<(u32, usize, usize, u64, u64)>>,
+        queue: &mut MergeQueue,
     ) {
         let Some(left_node) = nodes.get(left) else {
             return;
