@@ -113,3 +113,17 @@ Add dated entries for material decisions. Record superseded decisions rather tha
 - Decision: BYVA is trained as a bilingual Indonesian/English model. Only per-language configs of verified sources are admitted (c4 `id`, wikipedia `20231101.id`/`20231101.en`, OSCAR-2301 `id`/`en`, FineWeb/FineWeb-Edu English, TinyStories English). Multilingual dumps are consumed exclusively through their id/en subsets, and no other language enters pretraining.
 - Rationale: A small (~42M) model has limited capacity; concentrating it on two languages maximizes measured quality, Indonesian is the project's primary audience, and English data provides the strongest public capability signal that transfers.
 - Consequences: Mixture weights (id:en ratio) are decided per training run and recorded in the run manifest; added sources must fit the two-language scope or be rejected. OSCAR-2301 sampling is blocked on Hub authentication (HTTP 401) and stays pending until an HF token is provided.
+
+## D-0017 — BPE trainer determinism contract and Python tokenizer mirror
+- Status: Accepted
+- Date: 2026-11-27
+- Decision: The 32,768-merge BPE table is trained by `training/train_bpe.py` (pure stdlib) directly on Phase 2 shard documents with no pre-tokenization boundary, matching `Tokenizer::encode_bytes`. Determinism is contractual: pair counts are aggregated over the document set (input order never matters), each step merges the pair with the highest count, ties broken by (left, right) ascending, and occurrences are replaced left-to-right without overlap. `training/byva_tokenizer.py` mirrors the Rust encode/decode/validate semantics for training-time use, and a golden artifact trained on the smoke fixture (`crates/tokenizer/tests/golden/bpe_smoke_v1.json`) must regenerate byte-identically in Python and round-trip through the Rust tokenizer in CI.
+- Rationale: Training/serve segment mismatch would silently corrupt the model; D-0015 makes the trained table a prerequisite for the real T4 run, so its determinism must be pinned cross-language now.
+- Consequences: Any change to the Rust encoder or the Python mirror that alters segmentation must update both sides and regenerate the golden fixture in the same commit. The exact incremental trainer is memory-bounded (index scales with corpus size); corpora beyond a few tens of MB need a scaled trainer before the 32k table can be trained on them — recorded as an open Phase 3/8 hardware item.
+
+## D-0018 — Checkpoint format v2: FP16 GradScaler state, fp16 and gradient-accumulation training
+- Status: Accepted
+- Date: 2026-11-27
+- Decision: `byva-train-checkpoint-v2` extends v1 with the GradScaler state (null when FP16 is off); the loader accepts v1 and v2 and rejects unknown formats. The reference trainer gains `--config {tiny,small}` (frozen D-0013 configurations), `--tokenizer <artifact>` (production BPE path; byte-level stays the explicit fallback per D-0015), `--device`, `--fp16` (CUDA autocast + GradScaler), and `--grad-accum N` (per-micro-batch backward, loss history records the accumulated mean cross-entropy so it is comparable across accumulation factors).
+- Rationale: The T4 gate requires a real FP16 run of the SMALL config, and Colab sessions die mid-run; a resumed run that drops scaler state would fork the loss trajectory exactly like lost RNG state.
+- Consequences: Phase 4 conversion must accept v2 checkpoints; resuming an FP16 run requires a v2 checkpoint (v1 loads only for FP32). Any further field addition bumps the format again per D-0014.

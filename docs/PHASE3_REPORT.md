@@ -138,3 +138,50 @@ recorded here instead.
 - `cargo test --workspace --all-targets`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 - `cargo check --manifest-path fuzz/Cargo.toml`
+
+## Session addendum (2026-11-27, CPU sandbox): BPE trainer + Colab notebook
+
+### What was implemented and run
+
+- `training/train_bpe.py` — deterministic byte-level BPE trainer (pure stdlib,
+  D-0017): trains directly on shard documents with no pre-tokenization
+  boundary; incremental pair counts with lazy heap selection, tie-break
+  (count desc, left asc, right asc); emits a versioned artifact loadable by
+  `Tokenizer::from_artifact`.
+- `training/byva_tokenizer.py` — Python mirror of the Rust tokenizer
+  (NFC + ranked merges via the same lazy-heap algorithm, validation, decode via
+  merge-child expansion) used by the trainer and trainer tests.
+- `training/train.py` extended (D-0018): `--config {tiny,small}`,
+  `--tokenizer <artifact>` (production BPE path), `--device`, `--fp16`
+  (CUDA autocast + GradScaler), `--grad-accum N`; checkpoint format bumped to
+  `byva-train-checkpoint-v2` storing GradScaler state (v1 still loads).
+- `training/colab_t4.ipynb` — Colab T4 notebook: build shards → train the
+  32,768 BPE table → SMALL FP16 run with grad accumulation and Drive-backed
+  resumable checkpoints → print gate evidence.
+
+### Tests actually run in this session
+
+- `python3 -m unittest tests.test_train_bpe` — 12 tests PASS (artifact shape,
+  naive-BPE equivalence, merge order, permutation determinism, exhaustion and
+  bounds errors, end-to-end via build_shards, golden regression, control-id
+  rejection).
+- `cargo test -p byva-tokenizer --test golden` — 3 tests PASS including the new
+  cross-language round-trip: the Python-trained golden fixture
+  (`crates/tokenizer/tests/golden/bpe_smoke_v1.json`, 64 merges) loads into the
+  Rust tokenizer and round-trips the fixture texts exactly.
+- `python3 -m unittest discover -s training/tests` — 31 tests PASS (PyTorch
+  2.15.0+cpu installed in this session, same version as the original Phase 3
+  environment): all BPE trainer tests plus the torch suite, including the new
+  grad-accumulation resume bit-for-bit test, checkpoint v2 save/load with v1
+  backward compatibility, the fp16-requires-CUDA guard, and a BPE-token-stream
+  training run with falling loss.
+- `python3 training/train.py --smoke --steps 60` — PASS (CLI end-to-end after
+  the D-0018 changes: loss 10.4615 → 0.0422, learned pattern regenerated).
+
+### Still open for the Phase 3 gate
+
+- Real T4 training run (SMALL, FP16, grad accumulation) — notebook ready; run
+  it in Colab and record evidence here.
+- The 32,768 BPE table itself is NOT yet trained: no Phase 2 full-corpus
+  shards exist in this environment, and the exact trainer is memory-bounded;
+  train it in Colab per the notebook (or a future scaled trainer, D-0017).
