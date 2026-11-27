@@ -85,3 +85,24 @@ Add dated entries for material decisions. Record superseded decisions rather tha
 - Decision: The shard pipeline (training/byva_data.py) normalizes (NFC), filters by length, deduplicates by SHA-256, sorts by content-hash id, and emits canonical-JSON shards whose output depends only on the document set — never on input order, file grouping, or absolute paths. Manifests record file names (not paths), per-shard sha256 and byte counts, config, and stats. Determinism is enforced in CI by a frozen fixture regression test.
 - Rationale: Reproducible shards are the Phase 2 gate; nondeterministic preprocessing would make training runs incomparable.
 - Consequences: Any change to normalization, filtering, hashing, or canonical-JSON encoding that alters output must update the frozen fixture and its expected manifest in the same commit, with the change called out in the gate report.
+
+## D-0013 — Decoder-only architecture and two frozen configurations
+- Status: Accepted
+- Date: 2026-11-27
+- Decision: BYVA is a decoder-only transformer with pre-norm blocks, causal multi-head attention, GELU MLP (attention/MLP linears without bias), learned absolute positions, and tied token-embedding/output weights by default. Two configurations are frozen in crates/model: SMALL (d=512, 8 layers, 8 heads, ffn 2048, seq 1024; 42,484,736 params) as the Colab T4 training target, and TINY (d=256, 4 layers, 8 heads, ffn 1024, seq 512; 11,670,016 params) for CPU/CI smoke runs and benchmarks. The Python trainer mirrors the Rust ModelConfig, and cross-checking tests pin the parameter counts on both sides.
+- Rationale: The T4 16GB target is memory- and throughput-constrained; a ~42M model trains comfortably with FP16 and leaves room for activations, while TINY keeps gates runnable on CPU-only hardware. Weight tying saves the 16.8M-parameter output projection.
+- Consequences: Phase 4 conversion and the Phase 5 Rust runtime must implement exactly this layout; any architecture change updates both sides plus the frozen golden counts in the same commit.
+
+## D-0014 — Resumable training checkpoint format
+- Status: Accepted
+- Date: 2026-11-27
+- Decision: Training checkpoints use format `byva-train-checkpoint-v1` and store step, model state, optimizer state, torch and Python RNG states, the model config, and the loss history. Resuming must reproduce the uninterrupted run exactly; this is enforced by a test that compares loss histories.
+- Rationale: Phase 3's gate requires resumable checkpoints, and Colab sessions die mid-run; a checkpoint that loses RNG or optimizer state would silently fork the training trajectory.
+- Consequences: Checkpoints stay out of Git (D-0007). Adding fields requires bumping the format version and rejecting unknown formats with a typed error.
+
+## D-0015 — Dataset smoke runs use byte-level ids until the BPE vocab exists
+- Status: Accepted
+- Date: 2026-11-27
+- Decision: Until a 32,768-merge BPE table is trained from BYVA shards, dataset smoke trainings encode UTF-8 bytes directly (ids 0..255) inside the full-size vocabulary. Production pretraining uses only the trained tokenizer artifact, never raw bytes.
+- Rationale: ModelConfig pins the production vocabulary range, and no tokenizer artifact at that size exists yet; byte-level smokes still exercise the full training/checkpoint/generation path on real data without blocking on tokenizer training.
+- Consequences: Smoke loss numbers are byte-level and are not comparable to future BPE numbers; reports must label which encoding produced a number. Training the BPE table on Phase 2 shards is a prerequisite for the real T4 run.
