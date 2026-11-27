@@ -50,6 +50,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-targets
+      - name: Run data pipeline tests
+        run: python3 -m unittest discover -s training/tests -v
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings

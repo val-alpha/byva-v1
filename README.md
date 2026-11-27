@@ -2,7 +2,7 @@
 
 BYVA is an experimental language model project built from random initialization, with a native Rust inference runtime and a versioned conversation/token format.
 
-> Project status: Phase 1 complete (tokenizer + BYVA streaming format, gate reported in docs/PHASE1_REPORT.md). No model has been pretrained, no dataset has been admitted, and no inference backend has been validated yet.
+> Project status: Phase 2 complete (verified data review in docs/DATA.md, deterministic shard pipeline in training/, gate reported in docs/PHASE2_REPORT.md). No model has been pretrained, no dataset has been admitted for a training run, and no inference backend has been validated yet.
 
 ## Project constraints
 

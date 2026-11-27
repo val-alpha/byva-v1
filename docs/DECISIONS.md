@@ -71,3 +71,17 @@ Add dated entries for material decisions. Record superseded decisions rather tha
 - Decision: Reproducible Criterion benchmarks live in `crates/*/benches` and are recorded per environment in docs/PERFORMANCE.md, starting with a CPU-only baseline for tokenizer and format on a small-model merge table (8k merges). GPU numbers are recorded only after capability detection and validation on real hardware; a backend without measured runs is never described as supported or fast.
 - Rationale: CPU is the correctness baseline and the only hardware available in the current environment; early baselines catch tokenization/parsing regressions before inference exists.
 - Consequences: Benchmarks compile in CI via workspace checks but are not run in CI; recorded numbers must state toolchain, CPU, and date. Phase 7 replaces these entries with reproducible Criterion plus end-to-end benchmarks.
+
+## D-0011 — Dataset admission requires primary-source license verification
+- Status: Accepted
+- Date: 2026-11-26
+- Decision: A dataset enters the BYVA corpus only after its license is read from the dataset's own metadata with the dataset sha recorded at retrieval time, and its redistribution obligations (attribution, share-alike) are noted in docs/DATA.md. Synthetic-data caveats are recorded explicitly.
+- Rationale: Third-party license summaries drift and can be wrong; provenance must be auditable from the primary source.
+- Consequences: Phase 2 review verified TinyStories (CDLA-Sharing-1.0, synthetic), allenai/c4 (ODC-BY 1.0), and wikimedia/wikipedia (CC BY-SA 3.0 + GFDL) via the Hugging Face dataset API on 2026-11-26 because the Exa connector was unavailable; that substitution is recorded as such. Unreviewed sources stay unadmitted.
+
+## D-0012 — Shards are deterministic and manifests are portable
+- Status: Accepted
+- Date: 2026-11-26
+- Decision: The shard pipeline (training/byva_data.py) normalizes (NFC), filters by length, deduplicates by SHA-256, sorts by content-hash id, and emits canonical-JSON shards whose output depends only on the document set — never on input order, file grouping, or absolute paths. Manifests record file names (not paths), per-shard sha256 and byte counts, config, and stats. Determinism is enforced in CI by a frozen fixture regression test.
+- Rationale: Reproducible shards are the Phase 2 gate; nondeterministic preprocessing would make training runs incomparable.
+- Consequences: Any change to normalization, filtering, hashing, or canonical-JSON encoding that alters output must update the frozen fixture and its expected manifest in the same commit, with the change called out in the gate report.

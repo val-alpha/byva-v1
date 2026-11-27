@@ -1,0 +1,12 @@
+{"text":"Teks bahasa Indonesia nomor satu untuk pengujian pipeline data BYVA yang deterministik."}
+{"text":"Second English document used to exercise the deterministic ordering of shards."}
+{"text":"Cerita pendek berbahasa Indonesia tentang kucing yang penasaran dengan mesin cuci di rumah."}
+{"text":"A tiny story about a brave rabbit who crossed the long wooden bridge in the morning fog."}
+{"text":"Data web crawl bahasa Indonesia contoh: harga cabai rawit merah naik di pasar tradisional."}
+{"text":"Wikipedia contoh: Jakarta adalah ibu kota Indonesia dengan populasi lebih dari sepuluh juta jiwa."}
+{"text":"Minggu lalu keluarga Beep pergi ke pantai dan membawa bekal nasi goreng serta teh manis."}
+{"text":"Short paragraph retained because it exceeds the configured minimum character threshold."}
+{"text":"Teks bahasa Indonesia nomor satu untuk pengujian pipeline data BYVA yang deterministik."}
+{"text":"Pendek"}
+{"text":"Kalimat tambahan agar jumlah dokumen kept mencapai dua shard penuh dalam fixture ini."}
+{"text":"The last fixture document ensures the second shard contains at least one record."}

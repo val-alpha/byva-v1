@@ -21,3 +21,4 @@ venv/
 .ipynb_checkpoints/
 fuzz/artifacts/
 fuzz/corpus/
+fuzz/target/
