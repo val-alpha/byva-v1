@@ -74,6 +74,26 @@ Measured results (byte-level ids, tiny config):
   degenerate byte-level text (`"n dan dan dan …"`) — expected for an 11.7M-param
   byte-level model after 400 steps; recorded as-is (no overclaiming).
 
+## Addendum (2026-11-27): bilingual id+en expansion (D-0016)
+
+Per the language-focus decision, the verified source set grew from three to
+seven datasets (see docs/DATA.md): + FineWeb, FineWeb-Edu (both ODC-BY,
+English), OSCAR-2301 (CC0-1.0, gated — sampling pending an HF token), and
+wikipedia `20231101.en`. uonlp/CulturaX was verified and **rejected** (license
+field empty on the Hub).
+
+Second real-dataset smoke run (same tiny config, byte-level, CPU):
+
+- Corpus: 5 accessible sources, 2,493/2,500 docs kept, 5 shards, manifest
+  sha256 `1f6e7f52a149d8d02080ae5f6495840b4078700d4d02e353e5aa7fa6694f8b07`.
+- Command: `python3 training/train.py --shards /tmp/byva-data/shards-bilingual
+  --steps 400 --seq-len 128 --batch-size 16`.
+- Loss fell **10.4433 → 2.7811** over 400 steps (val 3.37 → 2.80); held-out
+  greedy generation remains degenerate byte-level text, recorded as-is.
+- OSCAR-2301 (`id`, the main additional Indonesian source) is NOT sampled:
+  datasets-server returns HTTP 401 without authentication. Pending the user's
+  HF token; everything else was fetched anonymously.
+
 ## Not run
 
 - **Real T4 training run** — the environment has no GPU. The gate item stays
@@ -84,6 +104,7 @@ Measured results (byte-level ids, tiny config):
   the trained tokenizer artifact.
 - **c4/wikipedia full-corpus shards** — needs multi-GB downloads and storage
   outside this environment.
+- **OSCAR-2301 sample** — gated dataset (HTTP 401); needs HF authentication.
 
 ## CI
 

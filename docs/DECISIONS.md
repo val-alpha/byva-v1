@@ -106,3 +106,10 @@ Add dated entries for material decisions. Record superseded decisions rather tha
 - Decision: Until a 32,768-merge BPE table is trained from BYVA shards, dataset smoke trainings encode UTF-8 bytes directly (ids 0..255) inside the full-size vocabulary. Production pretraining uses only the trained tokenizer artifact, never raw bytes.
 - Rationale: ModelConfig pins the production vocabulary range, and no tokenizer artifact at that size exists yet; byte-level smokes still exercise the full training/checkpoint/generation path on real data without blocking on tokenizer training.
 - Consequences: Smoke loss numbers are byte-level and are not comparable to future BPE numbers; reports must label which encoding produced a number. Training the BPE table on Phase 2 shards is a prerequisite for the real T4 run.
+
+## D-0016 — Bilingual language focus: Indonesian + English only
+- Status: Accepted
+- Date: 2026-11-27
+- Decision: BYVA is trained as a bilingual Indonesian/English model. Only per-language configs of verified sources are admitted (c4 `id`, wikipedia `20231101.id`/`20231101.en`, OSCAR-2301 `id`/`en`, FineWeb/FineWeb-Edu English, TinyStories English). Multilingual dumps are consumed exclusively through their id/en subsets, and no other language enters pretraining.
+- Rationale: A small (~42M) model has limited capacity; concentrating it on two languages maximizes measured quality, Indonesian is the project's primary audience, and English data provides the strongest public capability signal that transfers.
+- Consequences: Mixture weights (id:en ratio) are decided per training run and recorded in the run manifest; added sources must fit the two-language scope or be rejected. OSCAR-2301 sampling is blocked on Hub authentication (HTTP 401) and stays pending until an HF token is provided.
