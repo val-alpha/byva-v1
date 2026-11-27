@@ -94,6 +94,24 @@ Second real-dataset smoke run (same tiny config, byte-level, CPU):
   datasets-server returns HTTP 401 without authentication. Pending the user's
   HF token; everything else was fetched anonymously.
 
+### Third smoke run (2026-11-27, deeper samples + HF token)
+
+- Samples deepened to 5,300 docs / ~43 MB (c4-id 1,500, wikipedia-id 1,200,
+  fineweb-edu 1,000, wikipedia-en 800, TinyStories 800); pipeline kept
+  5,288/5,300 into 9 shards, manifest sha256
+  `8a850f36da89f7ab920790452785ee88034abb154e62de93ba0959ed6afb8026`.
+- OSCAR-2301 stays unsampled for a different reason: with a valid HF token the
+  datasets-server endpoints return 404 (the dataset is not indexed in the
+  viewer), and its repository distributes bulk `*_meta` parts of ~600 MB
+  `.jsonl.zst` each (16 parts for `id`) — bulk-download territory, deferred to
+  the Colab scale-up. The token itself worked (401 → authenticated).
+- Command: `--steps 600 --seq-len 128 --batch-size 16` on the 5,288-doc
+  corpus. Loss fell **10.4423 → 3.0652** train over 600 steps; **val loss
+  fell monotonically 3.19 → 2.8749** — the bilingual corpus is still being
+  learned at 600 steps (no plateau), consistent with the tiny byte-level
+  config being far from convergence.
+- Greedy generation remains degenerate byte-level text; recorded as-is.
+
 ## Not run
 
 - **Real T4 training run** — the environment has no GPU. The gate item stays
