@@ -64,3 +64,10 @@ Add dated entries for material decisions. Record superseded decisions rather tha
 - Decision: Do not declare a package or repository license until the repository owner selects one.
 - Rationale: A public GitHub repository is not, by itself, an indication that its contents are licensed for reuse.
 - Consequences: License metadata and any LICENSE file remain intentionally absent. Dataset license review in Phase 2 remains mandatory regardless of the repository license.
+
+## D-0010 — CPU-first benchmarking policy
+- Status: Accepted
+- Date: 2026-11-26
+- Decision: Reproducible Criterion benchmarks live in `crates/*/benches` and are recorded per environment in docs/PERFORMANCE.md, starting with a CPU-only baseline for tokenizer and format on a small-model merge table (8k merges). GPU numbers are recorded only after capability detection and validation on real hardware; a backend without measured runs is never described as supported or fast.
+- Rationale: CPU is the correctness baseline and the only hardware available in the current environment; early baselines catch tokenization/parsing regressions before inference exists.
+- Consequences: Benchmarks compile in CI via workspace checks but are not run in CI; recorded numbers must state toolchain, CPU, and date. Phase 7 replaces these entries with reproducible Criterion plus end-to-end benchmarks.

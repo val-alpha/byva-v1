@@ -12,9 +12,14 @@ unicode-normalization = "0.1"
 serde.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 proptest = "1.6"
 serde_json.workspace = true
 unicode-normalization = "0.1"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "tokenizer_bench"
+harness = false
