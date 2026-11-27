@@ -419,7 +419,10 @@ impl StreamingParser {
                 return events;
             }
             if token.0 >= tokenizer.vocab_size() {
-                self.fail("content token ID is outside the tokenizer vocabulary", &mut events);
+                self.fail(
+                    "content token ID is outside the tokenizer vocabulary",
+                    &mut events,
+                );
                 return events;
             }
             self.call_stop_seen = false;
@@ -898,7 +901,11 @@ mod tests {
         let tokenizer = tokenizer();
         let mut parser = StreamingParser::default();
         let events = parser.push_untrusted_token(S::Call.id(), &tokenizer);
-        assert!(events.iter().any(|event| matches!(event, ParseEvent::ParseError(_))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ParseEvent::ParseError(_)))
+        );
     }
 
     #[test]
@@ -908,7 +915,11 @@ mod tests {
         let mut events = parser.push(S::Assistant.id(), &tokenizer);
         events.extend(parser.push_untrusted_text("literal <|call|>", &tokenizer));
         assert_eq!(joined_delta(&events, false), "literal <|call|>");
-        assert!(!events.iter().any(|event| matches!(event, ParseEvent::CallStarted)));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ParseEvent::CallStarted))
+        );
     }
 
     #[test]
@@ -989,7 +1000,11 @@ mod tests {
             }
             events.extend(parser.finish());
             if end + 1 == complete.len() {
-                assert!(events.iter().any(|event| matches!(event, ParseEvent::ParseError(_))));
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, ParseEvent::ParseError(_)))
+                );
             }
         }
     }

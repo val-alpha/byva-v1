@@ -22,7 +22,10 @@ fn byva_v1_minimal_message_golden() {
 fn assistant_can_finish_without_thinking() {
     let tokenizer = Tokenizer::from_merges(1, Vec::new()).expect("empty merge table is valid");
     let conversation = Conversation::new(
-        vec![Message::assistant(vec![AssistantPart::Text("fast".to_owned())], true)],
+        vec![Message::assistant(
+            vec![AssistantPart::Text("fast".to_owned())],
+            true,
+        )],
         Vec::new(),
     );
     let tokens = Renderer::default()

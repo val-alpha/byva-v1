@@ -196,7 +196,8 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Build a small/in-memory tokenizer. Production artifacts should use from_artifact.
     pub fn from_merges(version: u32, merges: Vec<Merge>) -> Result<Self, TokenizerError> {
-        let merge_count = u32::try_from(merges.len()).map_err(|_| TokenizerError::VocabSizeMismatch)?;
+        let merge_count =
+            u32::try_from(merges.len()).map_err(|_| TokenizerError::VocabSizeMismatch)?;
         let vocab_size = FIRST_MERGE_ID
             .checked_add(merge_count)
             .ok_or(TokenizerError::VocabSizeMismatch)?;
@@ -213,7 +214,9 @@ impl Tokenizer {
 
     fn build(version: u32, vocab_size: u32, merges: Vec<Merge>) -> Result<Self, TokenizerError> {
         let expected_size = FIRST_MERGE_ID
-            .checked_add(u32::try_from(merges.len()).map_err(|_| TokenizerError::VocabSizeMismatch)?)
+            .checked_add(
+                u32::try_from(merges.len()).map_err(|_| TokenizerError::VocabSizeMismatch)?,
+            )
             .ok_or(TokenizerError::VocabSizeMismatch)?;
         if expected_size != vocab_size {
             return Err(TokenizerError::VocabSizeMismatch);
@@ -242,8 +245,7 @@ impl Tokenizer {
             {
                 return Err(TokenizerError::DuplicateMerge(index));
             }
-            merge_children[output_id as usize] =
-                Some((TokenId(merge.left), TokenId(merge.right)));
+            merge_children[output_id as usize] = Some((TokenId(merge.left), TokenId(merge.right)));
         }
 
         Ok(Self {
@@ -433,11 +435,13 @@ impl Tokenizer {
 
     /// Check whether untrusted text contains a literal spelling reserved for control tokens.
     pub fn contains_special_token_spelling(text: &str) -> bool {
-        if SPECIAL_TOKEN_SPELLINGS.iter().any(|spelling| text.contains(spelling)) {
+        if SPECIAL_TOKEN_SPELLINGS
+            .iter()
+            .any(|spelling| text.contains(spelling))
+        {
             return true;
         }
-        (0..RESERVED_TOKEN_COUNT)
-            .any(|index| text.contains(&format!("<|reserved_{index}|>")))
+        (0..RESERVED_TOKEN_COUNT).any(|index| text.contains(&format!("<|reserved_{index}|>")))
     }
 }
 
@@ -485,7 +489,10 @@ mod tests {
         let text = "literal <|call|> and <|reserved_3|>";
         let encoded = tokenizer.encode_content(text);
         assert!(encoded.iter().all(|id| id.0 >= BYTE_TOKEN_BASE));
-        assert_eq!(tokenizer.decode_content(&encoded).ok().as_deref(), Some(text));
+        assert_eq!(
+            tokenizer.decode_content(&encoded).ok().as_deref(),
+            Some(text)
+        );
     }
 
     #[test]
@@ -493,14 +500,20 @@ mod tests {
         let tokenizer = toy_tokenizer();
         let encoded = tokenizer.encode_content("hell");
         assert_eq!(encoded, vec![TokenId(FIRST_MERGE_ID + 2)]);
-        assert_eq!(tokenizer.decode_content(&encoded).ok().as_deref(), Some("hell"));
+        assert_eq!(
+            tokenizer.decode_content(&encoded).ok().as_deref(),
+            Some("hell")
+        );
     }
 
     #[test]
     fn nfc_normalization_is_applied() {
         let tokenizer = toy_tokenizer();
         let encoded = tokenizer.encode_content("e\u{301}");
-        assert_eq!(tokenizer.decode_content(&encoded).ok().as_deref(), Some("é"));
+        assert_eq!(
+            tokenizer.decode_content(&encoded).ok().as_deref(),
+            Some("é")
+        );
     }
 
     #[test]
@@ -523,6 +536,51 @@ mod tests {
             tokenizer.decode_content(&[SpecialToken::Call.id()]),
             Err(TokenizerError::ControlTokenInContent(11))
         ));
+    }
+
+    #[test]
+    fn truncated_or_invalid_utf8_content_fails_without_panicking() {
+        let tokenizer = toy_tokenizer();
+        let bytes: Vec<Vec<u8>> = vec![
+            vec![0xF0, 0x9F, 0x98],
+            vec![0xC3],
+            vec![0xE2, 0x82],
+            vec![0x41, 0xC0, 0xAF, 0x42],
+            vec![0xED, 0xA0, 0x80],
+            vec![0xF5, 0x80, 0x80, 0x80],
+        ];
+        for truncated in bytes {
+            let tokens: Vec<TokenId> = truncated
+                .iter()
+                .map(|byte| TokenId(BYTE_TOKEN_BASE + u32::from(*byte)))
+                .collect();
+            let result = tokenizer.decode_content(&tokens);
+            assert!(
+                matches!(result, Err(TokenizerError::InvalidUtf8(_))),
+                "truncated bytes {truncated:?} must error, not panic"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_serde_round_trips_and_reloads_deterministically() {
+        let tokenizer = toy_tokenizer();
+        let artifact = tokenizer.to_artifact();
+        let serialized = serde_json::to_string(&artifact).expect("artifact serializes");
+        let deserialized: TokenizerArtifact =
+            serde_json::from_str(&serialized).expect("artifact deserializes");
+        assert_eq!(deserialized, artifact);
+
+        let reloaded = Tokenizer::from_merges(deserialized.version, deserialized.merges)
+            .expect("reloaded artifact is valid");
+        let sample = ["hello", "hell", "he", "", "\u{1F600}", "l\u{301}"];
+        for text in sample {
+            assert_eq!(
+                reloaded.encode_content(text),
+                tokenizer.encode_content(text),
+                "reloaded tokenizer diverged on {text:?}"
+            );
+        }
     }
 
     proptest! {
