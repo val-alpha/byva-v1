@@ -18,28 +18,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 try:
     import torch
 
+    from train import (
+        SMOKE_PATTERN_PERIOD,
+        DecoderOnlyTransformer,
+        ModelConfig,
+        TrainState,
+        byte_token_stream,
+        load_checkpoint,
+        load_shard_texts,
+        make_sequences,
+        save_checkpoint,
+        smoke_token_stream,
+        train,
+    )
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
 
-from train import (
-    SMOKE_PATTERN_PERIOD,
-    DecoderOnlyTransformer,
-    ModelConfig,
-    TrainState,
-    byte_token_stream,
-    load_checkpoint,
-    load_shard_texts,
-    make_sequences,
-    save_checkpoint,
-    smoke_token_stream,
-    train,
-)
-
-TINY = ModelConfig(d_model=256, n_layers=4, n_heads=8, ffn_hidden=1024, max_seq_len=512)
-SMALL = ModelConfig(
-    d_model=512, n_layers=8, n_heads=8, ffn_hidden=2048, max_seq_len=1024
-)
+if TORCH_AVAILABLE:
+    TINY = ModelConfig(
+        d_model=256, n_layers=4, n_heads=8, ffn_hidden=1024, max_seq_len=512
+    )
+    SMALL = ModelConfig(
+        d_model=512, n_layers=8, n_heads=8, ffn_hidden=2048, max_seq_len=1024
+    )
+else:
+    TINY = None
+    SMALL = None
 
 
 def smoke_train_x_y():
