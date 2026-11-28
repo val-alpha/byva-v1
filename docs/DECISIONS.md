@@ -139,3 +139,26 @@ Add dated entries for material decisions. Record superseded decisions rather tha
   existing one exactly. `training/train.py` still encodes byte ids until it
   gains `--tokenizer` support, after which production pretraining consumes
   only the trained artifact (D-0015).
+
+## D-0019 — CPU-first performance budget and quality guardrails
+
+- Status: Accepted
+- Date: 2026-11-28
+- Decision: CPU speed is a first-class product requirement. The Rust runtime
+  (Phase 5) is designed against these single-thread greedy-decode budgets on a
+  documented reference CPU, measured with the Phase 7 harness before being
+  called met: TINY (11.7M params) ≥ 200 tokens/s and SMALL (42.5M params)
+  ≥ 50 tokens/s in fp32, with int8 weight quantization as the default CPU
+  path and int4 as opt-in. Quality is guarded, not assumed: a quantized or
+  optimized path may become default only after a recorded held-out loss/eval
+  delta against the fp32 reference stays within the threshold recorded in this
+  decision's first revision, measured on the Phase 3 bilingual held-out split.
+- Rationale: BYVA targets small models whose users run them on CPU-only
+  machines; "fast" must be a tracked budget with numbers, and "still smart"
+  must be a measured delta, or optimization silently trades one for the other.
+- Consequences: the runtime decode loop must be allocation-free per token
+  (preallocated buffers, contiguous row-major weights); SIMD paths (AVX2/NEON)
+  stay behind the backend abstraction with safe fallbacks and SAFETY-documented
+  unsafe (D-0006); first measured CPU decode numbers are recorded in
+  docs/PERFORMANCE.md when Phase 5 lands; budgets may be revised only with
+  measured evidence, never by editing the target silently.

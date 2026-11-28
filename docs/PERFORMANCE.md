@@ -52,6 +52,26 @@ empty merge table.
 Streaming-parser throughput is per token fed (each push expands tokens to bytes,
 maintains parser state, and emits deltas).
 
+## Tokenizer: production 32,768-vocab artifact (D-0017)
+
+Recorded 2026-11-28 on the same environment (Xeon 6985P-C, stable rustc,
+criterion 0.7). These use the committed
+`artifacts/tokenizer/byva-tokenizer-v1.json` (32,465 merges) via `from_artifact`,
+i.e. the real production table, not the synthetic 8k one.
+
+| Benchmark | Input | Median | Throughput |
+|---|---|---|---|
+| tokenizer_encode | 576 B text, 32k table → 240 tokens | 49.1 µs | 11.7 MiB/s |
+| tokenizer_decode | 576 B / 240 tokens, 32k table | 7.7 µs | 74.8 MiB/s |
+| tokenizer_load (`from_artifact`: JSON parse + full validation) | 32,465 merges (~823 KB JSON) | 1.86 ms | 453 MiB/s |
+
+Notes:
+- Production encode is ~2.8× slower than the 8k table (deeper merge chains to
+  inspect), but produces 240 vs 576 tokens on the same text — the 2.4×
+  compression is what matters downstream: fewer tokens into the model.
+- Load is a one-time cost per process and stays under 2 ms at production size.
+- Same 576 B bilingual sample as the 8k baseline for direct comparison.
+
 ## What is deliberately absent
 
 - Inference/decoder benchmarks: the runtime crate has no execution engine yet

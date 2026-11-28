@@ -1,14 +1,17 @@
 //! CPU-only Criterion benchmarks for the BYVA tokenizer, sized for a small model
-//! (8k merges, ~8.6k vocabulary). These are relative comparisons, not model-quality
-//! claims; GPU backends are benchmarked separately once validated hardware exists.
+//! (8k merges, ~8.6k vocabulary) and for the committed production 32k artifact.
+//! These are relative comparisons, not model-quality claims; GPU backends are
+//! benchmarked separately once validated hardware exists.
 
 use std::hint::black_box;
 use std::time::Duration;
 
-use byva_tokenizer::{BYTE_TOKEN_BASE, FIRST_MERGE_ID, Merge, Tokenizer};
+use byva_tokenizer::{BYTE_TOKEN_BASE, FIRST_MERGE_ID, Merge, Tokenizer, TokenizerArtifact};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 const SMALL_MERGE_COUNT: usize = 8_192;
+const PRODUCTION_ARTIFACT_JSON: &str =
+    include_str!("../../../artifacts/tokenizer/byva-tokenizer-v1.json");
 
 fn small_model_tokenizer() -> Tokenizer {
     let mut merges = Vec::with_capacity(SMALL_MERGE_COUNT);
@@ -27,35 +30,62 @@ fn small_model_tokenizer() -> Tokenizer {
     Tokenizer::from_merges(1, merges).expect("small-model merge table is valid")
 }
 
+fn production_tokenizer() -> Tokenizer {
+    let artifact: TokenizerArtifact =
+        serde_json::from_str(PRODUCTION_ARTIFACT_JSON).expect("committed 32k artifact parses");
+    Tokenizer::from_artifact(artifact).expect("committed 32k artifact validates")
+}
+
 fn sample_text() -> String {
     let sentence = "the quick brown fox jumps over the lazy dog while untuk berita hari ini ";
     sentence.repeat(8)
 }
 
 fn bench_encode(c: &mut Criterion) {
-    let tokenizer = small_model_tokenizer();
     let text = sample_text();
     let mut group = c.benchmark_group("tokenizer_encode");
     group.throughput(Throughput::Bytes(text.len() as u64));
     group.measurement_time(Duration::from_secs(10));
+    let small = small_model_tokenizer();
     group.bench_with_input(
         BenchmarkId::from_parameter(format!("{}b_8k_merges", text.len())),
         &text,
-        |b, text| b.iter(|| tokenizer.encode_content(black_box(text))),
+        |b, text| b.iter(|| small.encode_content(black_box(text))),
+    );
+    let production = production_tokenizer();
+    group.bench_with_input(
+        BenchmarkId::from_parameter(format!("{}b_32k_merges", text.len())),
+        &text,
+        |b, text| b.iter(|| production.encode_content(black_box(text))),
     );
     group.finish();
 }
 
 fn bench_decode(c: &mut Criterion) {
-    let tokenizer = small_model_tokenizer();
     let text = sample_text();
-    let encoded = tokenizer.encode_content(&text);
     let mut group = c.benchmark_group("tokenizer_decode");
     group.throughput(Throughput::Bytes(text.len() as u64));
+    let small = small_model_tokenizer();
+    let small_encoded = small.encode_content(&text);
     group.bench_with_input(
-        BenchmarkId::from_parameter(format!("{}b_{}_tokens", text.len(), encoded.len())),
-        &encoded,
-        |b, tokens| b.iter(|| tokenizer.decode_content(black_box(tokens))),
+        BenchmarkId::from_parameter(format!(
+            "{}b_{}_tokens_8k_merges",
+            text.len(),
+            small_encoded.len()
+        )),
+        &small_encoded,
+        |b, tokens| b.iter(|| small.decode_content(black_box(tokens))),
+    );
+    let production = production_tokenizer();
+    let production_encoded = production.encode_content(&text);
+    group.bench_with_input(
+        BenchmarkId::from_parameter(format!(
+            "{}b_{}_tokens_32k_merges",
+            text.len(),
+            production_encoded.len()
+        )),
+        &production_encoded,
+        |b, tokens| b.iter(|| production.decode_content(black_box(tokens))),
     );
     group.finish();
 }
@@ -68,9 +98,16 @@ fn bench_artifact_reload(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(json.len() as u64));
     group.bench_function("artifact_json_8k_merges", |b| {
         b.iter(|| {
-            let parsed: byva_tokenizer::TokenizerArtifact =
+            let parsed: TokenizerArtifact =
                 serde_json::from_str(black_box(&json)).expect("artifact parses");
             Tokenizer::from_merges(parsed.version, parsed.merges).expect("artifact validates")
+        })
+    });
+    group.bench_function("artifact_json_32k_from_artifact", |b| {
+        b.iter(|| {
+            let parsed: TokenizerArtifact =
+                serde_json::from_str(black_box(PRODUCTION_ARTIFACT_JSON)).expect("artifact parses");
+            Tokenizer::from_artifact(parsed).expect("artifact validates")
         })
     });
     group.finish();
