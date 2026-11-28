@@ -106,6 +106,8 @@ pub struct Trainer {
     en_cursor: usize,
     id_share: f64,
     mixture_history: Vec<MixtureRecord>,
+    train_mask: Option<Vec<f32>>,
+    val_mask: Option<Vec<f32>>,
 }
 
 impl Trainer {
@@ -171,6 +173,8 @@ impl Trainer {
         };
         let id_share = config.mixture_target_id.unwrap_or(0.0);
         Ok(Self {
+            train_mask: None,
+            val_mask: None,
             eval_rows: config.eval_rows.min(val.count()),
             config,
             layout,
@@ -194,6 +198,227 @@ impl Trainer {
             id_share,
             mixture_history: Vec::new(),
         })
+    }
+
+    /// Creates a masked-loss trainer (Phase 6 SFT): the loss covers only
+    /// positions whose mask weight is positive (response tokens only).
+    pub fn new_masked(
+        config: TrainConfig,
+        train: Sequences,
+        val: Sequences,
+        train_mask: Vec<f32>,
+        val_mask: Vec<f32>,
+    ) -> Result<Self, TrainerError> {
+        let mut trainer = Self::new(config, train, val)?;
+        trainer.set_loss_masks(train_mask, val_mask)?;
+        Ok(trainer)
+    }
+
+    /// Starts a fine-tune from a `byva-train-rust-checkpoint-v1` base:
+    /// weights (and the position-embedding prefix when the fine-tune uses a
+    /// shorter `seq_len`) come from the checkpoint, while the optimizer,
+    /// step counter, and loss histories start fresh.
+    pub fn fine_tune(
+        base_path: &std::path::Path,
+        config: TrainConfig,
+        train: Sequences,
+        val: Sequences,
+        train_mask: Option<Vec<f32>>,
+        val_mask: Option<Vec<f32>>,
+    ) -> Result<Self, TrainerError> {
+        config.validate()?;
+        let loaded = checkpoint::load(base_path)?;
+        let meta = loaded.meta;
+        if meta.format != FORMAT_ID {
+            return Err(TrainerError::UnknownCheckpointFormat { found: meta.format });
+        }
+        let base_model = meta.config.model;
+        let model = config.model.clone();
+        let mismatch = |reason: String| TrainerError::ConfigMismatch { reason };
+        if (
+            model.vocab,
+            model.d_model,
+            model.n_layers,
+            model.n_heads,
+            model.ffn,
+        ) != (
+            base_model.vocab,
+            base_model.d_model,
+            base_model.n_layers,
+            base_model.n_heads,
+            base_model.ffn,
+        ) {
+            return Err(mismatch(
+                "fine-tune model dimensions differ from the base checkpoint".to_string(),
+            ));
+        }
+        if model.seq_len > base_model.seq_len {
+            return Err(mismatch(format!(
+                "fine-tune seq_len {} exceeds the base checkpoint's {}",
+                model.seq_len, base_model.seq_len
+            )));
+        }
+        let layout = build_layout(&model)?;
+        let mut params = vec![0.0f32; layout.total];
+        for spec in &layout.specs {
+            let base_index = meta
+                .params
+                .iter()
+                .position(|desc| desc.name == spec.name)
+                .ok_or_else(|| {
+                    mismatch(format!("base checkpoint lacks parameter {}", spec.name))
+                })?;
+            let base_offset = meta
+                .params
+                .iter()
+                .take(base_index)
+                .map(|desc| desc.len)
+                .sum::<usize>();
+            let base_spec = &meta.params[base_index];
+            let dst = &mut params[spec.offset..spec.offset + spec.len];
+            if spec.name == "position_embedding.weight" {
+                let rows = model.seq_len * model.d_model;
+                if base_spec.len < rows {
+                    return Err(mismatch(format!(
+                        "base position embedding holds {} elements, need {}",
+                        base_spec.len, rows
+                    )));
+                }
+                dst.copy_from_slice(&loaded.params[base_offset..base_offset + rows]);
+            } else {
+                if base_spec.shape != spec.shape || base_spec.len != spec.len {
+                    return Err(mismatch(format!(
+                        "parameter {} layout differs: base {:?}/{:?}, config {:?}/{:?}",
+                        spec.name, base_spec.shape, base_spec.len, spec.shape, spec.len
+                    )));
+                }
+                dst.copy_from_slice(&loaded.params[spec.offset..spec.offset + spec.len]);
+            }
+        }
+        let optimizer = Self::fresh_optimizer(&config, &layout)?;
+        let id_share = config.mixture_target_id.unwrap_or(0.0);
+        let mut trainer = Self {
+            eval_rows: config.eval_rows.min(val.count()),
+            batch_size: config.batch_size()?,
+            config,
+            layout,
+            params,
+            optimizer,
+            train,
+            val,
+            step: 0,
+            batch_cursor: 0,
+            loss_history: Vec::new(),
+            eval_history: Vec::new(),
+            train_langs: None,
+            val_langs: None,
+            id_rows: Vec::new(),
+            en_rows: Vec::new(),
+            val_id_rows: Vec::new(),
+            val_en_rows: Vec::new(),
+            id_cursor: 0,
+            en_cursor: 0,
+            id_share,
+            mixture_history: Vec::new(),
+            train_mask: None,
+            val_mask: None,
+        };
+        if let (Some(train_mask), Some(val_mask)) = (train_mask, val_mask) {
+            trainer.set_loss_masks(train_mask, val_mask)?;
+        }
+        Ok(trainer)
+    }
+
+    fn fresh_optimizer(
+        config: &TrainConfig,
+        layout: &ParamLayout,
+    ) -> Result<Optimizer, TrainerError> {
+        match config.optimizer {
+            OptimizerKind::AdamW => Ok(Optimizer::AdamW(AdamW::new(
+                AdamWConfig {
+                    lr: config.learning_rate as f32,
+                    beta1: config.beta1 as f32,
+                    beta2: config.beta2 as f32,
+                    eps: config.eps as f32,
+                    weight_decay: config.weight_decay as f32,
+                },
+                layout.total,
+            )?)),
+            OptimizerKind::SignTrust => {
+                let counts: Vec<usize> = layout.specs.iter().map(|spec| spec.len).collect();
+                Ok(Optimizer::SignTrust(SignTrust::new(
+                    SignTrustConfig {
+                        lr: config.learning_rate as f32,
+                        beta1: config.beta1 as f32,
+                        weight_decay: config.weight_decay as f32,
+                        clamp_min: config.clamp_min as f32,
+                        clamp_max: config.clamp_max as f32,
+                    },
+                    &counts,
+                )?))
+            }
+        }
+    }
+
+    /// Attaches per-position loss masks (Phase 6 SFT): one weight per target
+    /// position of every train and val window. The K5 mixture is
+    /// incompatible with masked loss and is rejected here.
+    pub fn set_loss_masks(
+        &mut self,
+        train_mask: Vec<f32>,
+        val_mask: Vec<f32>,
+    ) -> Result<(), TrainerError> {
+        if self.config.mixture_target_id.is_some() {
+            return Err(TrainerError::ConfigInvalid {
+                reason: "masked loss cannot be combined with the K5 mixture".to_string(),
+            });
+        }
+        Self::validate_mask(
+            "train",
+            &train_mask,
+            self.train.count(),
+            self.config.model.seq_len,
+        )?;
+        Self::validate_mask(
+            "val",
+            &val_mask,
+            self.val.count(),
+            self.config.model.seq_len,
+        )?;
+        self.train_mask = Some(train_mask);
+        self.val_mask = Some(val_mask);
+        Ok(())
+    }
+
+    fn validate_mask(
+        name: &str,
+        mask: &[f32],
+        count: usize,
+        seq_len: usize,
+    ) -> Result<(), TrainerError> {
+        let invalid = |reason: String| TrainerError::DataInvalid { reason };
+        if mask.len() != count * seq_len {
+            return Err(invalid(format!(
+                "{} mask holds {} weights for {} windows of {} positions",
+                name,
+                mask.len(),
+                count,
+                seq_len
+            )));
+        }
+        if mask
+            .iter()
+            .any(|&weight| !weight.is_finite() || !(0.0..=1.0).contains(&weight))
+        {
+            return Err(invalid(format!(
+                "{} mask weights must be finite and within [0, 1]",
+                name
+            )));
+        }
+        if mask.iter().all(|&weight| weight == 0.0) {
+            return Err(invalid(format!("{} mask has no supervised position", name)));
+        }
+        Ok(())
     }
 
     /// Attaches per-window language tags for the K5 id:en mixture (D-0016).
@@ -259,6 +484,27 @@ impl Trainer {
         train: Sequences,
         val: Sequences,
     ) -> Result<Self, TrainerError> {
+        Self::resume_inner(path, train, val, None)
+    }
+
+    /// Restores a masked-loss (SFT) trainer from a checkpoint plus the same
+    /// masked dataset. The checkpoint must have been written by a masked run.
+    pub fn resume_masked(
+        path: &std::path::Path,
+        train: Sequences,
+        val: Sequences,
+        train_mask: Vec<f32>,
+        val_mask: Vec<f32>,
+    ) -> Result<Self, TrainerError> {
+        Self::resume_inner(path, train, val, Some((train_mask, val_mask)))
+    }
+
+    fn resume_inner(
+        path: &std::path::Path,
+        train: Sequences,
+        val: Sequences,
+        masks: Option<(Vec<f32>, Vec<f32>)>,
+    ) -> Result<Self, TrainerError> {
         let loaded = checkpoint::load(path)?;
         let meta = loaded.meta;
         let config = meta.config.clone();
@@ -293,6 +539,12 @@ impl Trainer {
         if meta.mixture_state.is_some() && config.mixture_target_id.is_none() {
             return Err(mismatch(
                 "checkpoint holds mixture state but its config disables the mixture".to_string(),
+            ));
+        }
+        if meta.masked_loss != masks.is_some() {
+            return Err(mismatch(
+                "checkpoint and resume disagree on masked loss; masked checkpoints resume only through resume_masked with the same dataset"
+                    .to_string(),
             ));
         }
         if meta.step > config.steps {
@@ -386,7 +638,7 @@ impl Trainer {
             Some(state) => (state.id_cursor, state.en_cursor, state.id_share),
             None => (0, 0, config.mixture_target_id.unwrap_or(0.0)),
         };
-        Ok(Self {
+        let mut trainer = Self {
             eval_rows: config.eval_rows.min(val.count()),
             config,
             layout,
@@ -409,7 +661,13 @@ impl Trainer {
             en_cursor,
             id_share,
             mixture_history: meta.mixture_history,
-        })
+            train_mask: None,
+            val_mask: None,
+        };
+        if let Some((train_mask, val_mask)) = masks {
+            trainer.set_loss_masks(train_mask, val_mask)?;
+        }
+        Ok(trainer)
     }
 
     /// Overrides the total step target of a resumed run.
@@ -450,12 +708,17 @@ impl Trainer {
         let seq_len = self.config.model.seq_len;
         let count = self.train.count();
         let rows = self.batch_rows();
+        let train_mask = self.train_mask.as_ref();
         let mut tokens = Vec::with_capacity(self.batch_size * seq_len);
         let mut targets = Vec::with_capacity(self.batch_size * seq_len);
+        let mut mask = train_mask.map(|_| Vec::with_capacity(self.batch_size * seq_len));
         for row in rows {
             let span = row * seq_len..(row + 1) * seq_len;
             tokens.extend_from_slice(&self.train.x()[span.clone()]);
-            targets.extend_from_slice(&self.train.y()[span]);
+            targets.extend_from_slice(&self.train.y()[span.clone()]);
+            if let (Some(mask), Some(weights)) = (mask.as_mut(), train_mask) {
+                mask.extend_from_slice(&weights[span]);
+            }
         }
         let mut graph = Graph::new();
         let leaves = self.leaves(&mut graph)?;
@@ -466,6 +729,7 @@ impl Trainer {
             &leaves,
             &tokens,
             &targets,
+            mask.as_deref(),
         )?;
         let loss_value = graph.value(loss_node)?.data()[0];
         graph.backward(loss_node)?;
@@ -475,11 +739,17 @@ impl Trainer {
                 grads[spec.offset..spec.offset + spec.len].copy_from_slice(gradient);
             }
         }
+        let supervised = mask
+            .as_deref()
+            .map(|weights| weights.iter().sum::<f32>())
+            .unwrap_or(1.0);
         let next_step = self.step + 1;
-        let lr = self.config.learning_rate_at(next_step);
-        self.optimizer.set_learning_rate(lr)?;
-        self.optimizer
-            .step(&mut self.params, &grads, &self.layout)?;
+        if supervised > 0.0 {
+            let lr = self.config.learning_rate_at(next_step);
+            self.optimizer.set_learning_rate(lr)?;
+            self.optimizer
+                .step(&mut self.params, &grads, &self.layout)?;
+        }
         self.batch_cursor = (self.batch_cursor + self.batch_size) % count;
         self.step = next_step;
         self.loss_history.push(loss_value);
@@ -561,14 +831,26 @@ impl Trainer {
             tokens.extend_from_slice(&self.val.x()[span.clone()]);
             targets.extend_from_slice(&self.val.y()[span]);
         }
-        Ok(Some(self.forward_loss(&tokens, &targets)?))
+        Ok(Some(self.forward_loss(&tokens, &targets, None)?))
     }
 
     /// Mean held-out loss over the first `eval_rows` val windows (no
     /// backward pass).
     pub fn evaluate(&self) -> Result<f32, TrainerError> {
         let seq_len = self.config.model.seq_len;
-        let rows = self.eval_rows.min(self.val.count());
+        let val_mask = self.val_mask.as_ref();
+        let selected: Vec<usize> = match val_mask {
+            Some(mask) => (0..self.val.count())
+                .filter(|&row| {
+                    mask[row * seq_len..(row + 1) * seq_len]
+                        .iter()
+                        .any(|&weight| weight > 0.0)
+                })
+                .take(self.eval_rows)
+                .collect(),
+            None => (0..self.eval_rows.min(self.val.count())).collect(),
+        };
+        let rows = selected.len();
         if rows == 0 {
             return Err(TrainerError::DataInvalid {
                 reason: "val split has no windows".to_string(),
@@ -576,15 +858,29 @@ impl Trainer {
         }
         let mut tokens = Vec::with_capacity(rows * seq_len);
         let mut targets = Vec::with_capacity(rows * seq_len);
-        for row in 0..rows {
+        let mut mask = val_mask.map(|_| Vec::with_capacity(rows * seq_len));
+        for &row in &selected {
             let span = row * seq_len..(row + 1) * seq_len;
             tokens.extend_from_slice(&self.val.x()[span.clone()]);
-            targets.extend_from_slice(&self.val.y()[span]);
+            targets.extend_from_slice(&self.val.y()[span.clone()]);
+            if let (Some(mask), Some(weights)) = (mask.as_mut(), val_mask) {
+                mask.extend_from_slice(&weights[span]);
+            }
         }
-        self.forward_loss(&tokens, &targets)
+        self.forward_loss(&tokens, &targets, mask.as_deref())
     }
 
-    fn forward_loss(&self, tokens: &[u32], targets: &[u32]) -> Result<f32, TrainerError> {
+    /// Computes the (optionally masked) mean cross-entropy loss of the
+    /// current parameters over one batch of tokens and targets.
+    ///
+    /// # Errors
+    /// Fails when the batch shape is invalid or the forward pass errors.
+    pub fn forward_loss(
+        &self,
+        tokens: &[u32],
+        targets: &[u32],
+        mask: Option<&[f32]>,
+    ) -> Result<f32, TrainerError> {
         let mut graph = Graph::new();
         let leaves = self.leaves(&mut graph)?;
         let loss = forward(
@@ -594,6 +890,7 @@ impl Trainer {
             &leaves,
             tokens,
             targets,
+            mask,
         )?;
         Ok(graph.value(loss)?.data()[0])
     }
@@ -649,6 +946,7 @@ impl Trainer {
             eval_history: self.eval_history.clone(),
             mixture_history: self.mixture_history.clone(),
             mixture_state,
+            masked_loss: self.train_mask.is_some(),
             params,
             optimizer,
         };
@@ -688,6 +986,11 @@ impl Trainer {
         } else {
             0.0
         }
+    }
+
+    /// Whether the run trains with a per-position loss mask (Phase 6 SFT).
+    pub fn masked_loss(&self) -> bool {
+        self.train_mask.is_some()
     }
 
     /// The run configuration.

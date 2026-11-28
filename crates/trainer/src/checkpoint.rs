@@ -99,6 +99,10 @@ pub struct CheckpointMeta {
     /// Resumable K5 mixture state (None when the mixture is off).
     #[serde(default)]
     pub mixture_state: Option<MixtureState>,
+    /// Whether the run trains with a per-position loss mask (Phase 6 SFT:
+    /// loss on response tokens only). Old checkpoints default to false.
+    #[serde(default)]
+    pub masked_loss: bool,
     /// Parameter blob descriptions in canonical order.
     pub params: Vec<TensorDesc>,
     /// Optimizer state description.
@@ -164,8 +168,20 @@ pub fn load(path: &std::path::Path) -> Result<LoadedCheckpoint, TrainerError> {
         path: path_display.clone(),
         reason: error.to_string(),
     })?;
+    load_bytes_in(&path_display, &bytes)
+}
+
+/// Reads, verifies, and parses a checkpoint from raw bytes.
+///
+/// # Errors
+/// Fails on every structural, integrity, or format problem [`load`] reports.
+pub fn load_bytes(bytes: &[u8]) -> Result<LoadedCheckpoint, TrainerError> {
+    load_bytes_in("<bytes>", bytes)
+}
+
+fn load_bytes_in(path_display: &str, bytes: &[u8]) -> Result<LoadedCheckpoint, TrainerError> {
     let corrupt = |reason: String| TrainerError::CheckpointCorrupt {
-        path: path_display.clone(),
+        path: path_display.to_string(),
         reason,
     };
     if bytes.len() < HEADER_LEN + DIGEST_LEN {

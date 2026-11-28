@@ -189,7 +189,8 @@ pub fn explain_step(config: &ModelConfig) -> Result<Vec<String>, TrainerError> {
 /// (tied-logit-free softmax cross-entropy, K2).
 ///
 /// `leaves` must be aligned with `layout.specs`; `tokens` must contain
-/// exactly `batch * seq_len` ids.
+/// exactly `batch * seq_len` ids. `mask` (Phase 6 SFT) carries one weight
+/// per target position; `None` trains on every position (pretraining).
 pub fn forward(
     graph: &mut Graph,
     config: &ModelConfig,
@@ -197,6 +198,7 @@ pub fn forward(
     leaves: &[NodeId],
     tokens: &[u32],
     targets: &[u32],
+    mask: Option<&[f32]>,
 ) -> Result<NodeId, TrainerError> {
     if leaves.len() != layout.specs.len() {
         return Err(TrainerError::ConfigInvalid {
@@ -220,6 +222,13 @@ pub fn forward(
         return Err(TrainerError::DataInvalid {
             reason: format!("{} targets for {} tokens", targets.len(), tokens.len()),
         });
+    }
+    if let Some(mask) = mask {
+        if mask.len() != targets.len() {
+            return Err(TrainerError::DataInvalid {
+                reason: format!("{} mask weights for {} targets", mask.len(), targets.len()),
+            });
+        }
     }
     let find = |name: &str| -> Result<NodeId, TrainerError> {
         let index = layout
@@ -285,5 +294,11 @@ pub fn forward(
     let final_gain = find("final_norm.weight")?;
     let final_bias = find("final_norm.bias")?;
     let final_normed = graph.layer_norm(x, final_gain, final_bias, 1e-5)?;
-    Ok(graph.cross_entropy_tied(final_normed, token_embedding, targets)?)
+    let loss = match mask {
+        None => graph.cross_entropy_tied(final_normed, token_embedding, targets)?,
+        Some(mask) => {
+            graph.cross_entropy_tied_masked(final_normed, token_embedding, targets, mask)?
+        }
+    };
+    Ok(loss)
 }

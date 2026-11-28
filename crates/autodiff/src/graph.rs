@@ -59,6 +59,12 @@ enum Op {
         targets: Vec<u32>,
         stats: Vec<CeRowStat>,
     },
+    CrossEntropyTiedMasked {
+        targets: Vec<u32>,
+        stats: Vec<CeRowStat>,
+        weights: Vec<f32>,
+        weight_sum: f64,
+    },
 }
 
 /// Per-row softmax statistics cached by the forward cross-entropy pass so
@@ -69,6 +75,109 @@ struct CeRowStat {
     max: f32,
     sum: f64,
     loss: f64,
+}
+
+/// Shared cross-entropy input validation: both inputs rank 2, widths agree,
+/// rows positive, targets in range. Returns `(n, d, vocab)`.
+fn validate_ce_inputs(
+    graph: &Graph,
+    hidden: NodeId,
+    table: NodeId,
+    targets: &[u32],
+    op: &'static str,
+) -> Result<(usize, usize, usize), AutodiffError> {
+    let (hidden_shape, table_shape) = graph.two_shapes(hidden, table)?;
+    if hidden_shape.len() != 2 || table_shape.len() != 2 {
+        return Err(AutodiffError::OpValidation {
+            op,
+            reason: format!(
+                "both inputs must be rank 2, found {:?} and {:?}",
+                hidden_shape, table_shape
+            ),
+        });
+    }
+    let (n, d) = (hidden_shape[0], hidden_shape[1]);
+    let (vocab, table_d) = (table_shape[0], table_shape[1]);
+    if d != table_d {
+        return Err(AutodiffError::OpValidation {
+            op,
+            reason: format!("hidden width {} differs from table width {}", d, table_d),
+        });
+    }
+    if n == 0 {
+        return Err(AutodiffError::OpValidation {
+            op,
+            reason: "row count must be positive".to_string(),
+        });
+    }
+    if targets.len() != n {
+        return Err(AutodiffError::OpValidation {
+            op,
+            reason: format!("{} targets for {} rows", targets.len(), n),
+        });
+    }
+    for &target in targets {
+        if target as usize >= vocab {
+            return Err(AutodiffError::OpValidation {
+                op,
+                reason: format!("target {} is out of range for vocab {}", target, vocab),
+            });
+        }
+    }
+    Ok((n, d, vocab))
+}
+
+/// Shared forward sweep: per-row logits, softmax statistics, and loss,
+/// computed one `[vocab]` row at a time in deterministic order.
+fn ce_forward_stats(
+    hidden_data: &[f32],
+    table_data: &[f32],
+    targets: &[u32],
+    n: usize,
+    d: usize,
+    vocab: usize,
+) -> Vec<CeRowStat> {
+    let mut table_t = vec![0.0f32; vocab * d];
+    transpose_dt(&mut table_t, table_data, vocab, d);
+    let mut rows = vec![
+        CeRowStat {
+            max: 0.0,
+            sum: 0.0,
+            loss: 0.0,
+        };
+        n
+    ];
+    for_each_chunk_mut(&mut rows, 1, |start, chunk| {
+        let mut logits_row = vec![0.0f32; vocab];
+        for (offset, row) in chunk.iter_mut().enumerate() {
+            let i = start + offset;
+            let hidden_row = &hidden_data[i * d..(i + 1) * d];
+            logits_row.fill(0.0);
+            for (l, &h) in hidden_row.iter().enumerate() {
+                let t_row = &table_t[l * vocab..(l + 1) * vocab];
+                for (slot, &t) in logits_row.iter_mut().zip(t_row) {
+                    *slot += h * t;
+                }
+            }
+            let mut max = f32::NEG_INFINITY;
+            for &l in logits_row.iter() {
+                if l > max {
+                    max = l;
+                }
+            }
+            let target_logit = logits_row[targets[i] as usize];
+            let mut sum = 0.0f64;
+            for slot in logits_row.iter_mut() {
+                let e = f32::exp(*slot - max);
+                *slot = e;
+                sum += f64::from(e);
+            }
+            row.max = max;
+            row.sum = sum;
+            row.loss = f64::from(max) + sum.ln() - f64::from(target_logit);
+        }
+    });
+    rows
 }
 
 struct Node {
@@ -559,92 +668,73 @@ impl Graph {
         table: NodeId,
         targets: &[u32],
     ) -> Result<NodeId, AutodiffError> {
-        let (hidden_shape, table_shape) = self.two_shapes(hidden, table)?;
-        if hidden_shape.len() != 2 || table_shape.len() != 2 {
-            return Err(AutodiffError::OpValidation {
-                op: "cross_entropy_tied",
-                reason: format!(
-                    "both inputs must be rank 2, found {:?} and {:?}",
-                    hidden_shape, table_shape
-                ),
-            });
-        }
-        let (n, d) = (hidden_shape[0], hidden_shape[1]);
-        let (vocab, table_d) = (table_shape[0], table_shape[1]);
-        if d != table_d {
-            return Err(AutodiffError::OpValidation {
-                op: "cross_entropy_tied",
-                reason: format!("hidden width {} differs from table width {}", d, table_d),
-            });
-        }
-        if n == 0 {
-            return Err(AutodiffError::OpValidation {
-                op: "cross_entropy_tied",
-                reason: "row count must be positive".to_string(),
-            });
-        }
-        if targets.len() != n {
-            return Err(AutodiffError::OpValidation {
-                op: "cross_entropy_tied",
-                reason: format!("{} targets for {} rows", targets.len(), n),
-            });
-        }
-        for &target in targets {
-            if target as usize >= vocab {
-                return Err(AutodiffError::OpValidation {
-                    op: "cross_entropy_tied",
-                    reason: format!("target {} is out of range for vocab {}", target, vocab),
-                });
-            }
-        }
+        let (n, d, vocab) = validate_ce_inputs(self, hidden, table, targets, "cross_entropy_tied")?;
         let hidden_data = self.data_ref(hidden)?;
         let table_data = self.data_ref(table)?;
-        let mut table_t = vec![0.0f32; vocab * d];
-        transpose_dt(&mut table_t, table_data, vocab, d);
-        let mut rows = vec![
-            CeRowStat {
-                max: 0.0,
-                sum: 0.0,
-                loss: 0.0,
-            };
-            n
-        ];
-        for_each_chunk_mut(&mut rows, 1, |start, chunk| {
-            let mut logits_row = vec![0.0f32; vocab];
-            for (offset, row) in chunk.iter_mut().enumerate() {
-                let i = start + offset;
-                let hidden_row = &hidden_data[i * d..(i + 1) * d];
-                logits_row.fill(0.0);
-                for (l, &h) in hidden_row.iter().enumerate() {
-                    let t_row = &table_t[l * vocab..(l + 1) * vocab];
-                    for (slot, &t) in logits_row.iter_mut().zip(t_row) {
-                        *slot += h * t;
-                    }
-                }
-                let mut max = f32::NEG_INFINITY;
-                for &l in logits_row.iter() {
-                    if l > max {
-                        max = l;
-                    }
-                }
-                let target_logit = logits_row[targets[i] as usize];
-                let mut sum = 0.0f64;
-                for slot in logits_row.iter_mut() {
-                    let e = f32::exp(*slot - max);
-                    *slot = e;
-                    sum += f64::from(e);
-                }
-                row.max = max;
-                row.sum = sum;
-                row.loss = f64::from(max) + sum.ln() - f64::from(target_logit);
-            }
-        });
+        let rows = ce_forward_stats(hidden_data, table_data, targets, n, d, vocab);
         let total: f64 = rows.iter().map(|row| row.loss).sum();
         let loss = (total / n as f64) as f32;
         self.push_output(
             Op::CrossEntropyTied {
                 targets: targets.to_vec(),
                 stats: rows,
+            },
+            vec![hidden, table],
+            &[],
+            vec![loss],
+        )
+    }
+
+    /// Tied-logit-free softmax cross-entropy with per-row weights: the loss
+    /// is `sum(loss_i * w_i) / sum(w_i)`, so positions weighted `0.0` are
+    /// fully excluded from the loss and from the gradients (Phase 6 SFT:
+    /// loss on response tokens only). Weights must be finite and
+    /// non-negative; an all-zero batch yields loss `0.0` and zero gradients.
+    pub fn cross_entropy_tied_masked(
+        &mut self,
+        hidden: NodeId,
+        table: NodeId,
+        targets: &[u32],
+        weights: &[f32],
+    ) -> Result<NodeId, AutodiffError> {
+        let (n, d, vocab) =
+            validate_ce_inputs(self, hidden, table, targets, "cross_entropy_tied_masked")?;
+        if weights.len() != n {
+            return Err(AutodiffError::OpValidation {
+                op: "cross_entropy_tied_masked",
+                reason: format!("{} weights for {} rows", weights.len(), n),
+            });
+        }
+        for (index, &weight) in weights.iter().enumerate() {
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(AutodiffError::OpValidation {
+                    op: "cross_entropy_tied_masked",
+                    reason: format!(
+                        "weight {index} must be finite and non-negative, found {weight}"
+                    ),
+                });
+            }
+        }
+        let weight_sum: f64 = weights.iter().map(|&weight| f64::from(weight)).sum();
+        let hidden_data = self.data_ref(hidden)?;
+        let table_data = self.data_ref(table)?;
+        let rows = ce_forward_stats(hidden_data, table_data, targets, n, d, vocab);
+        let total: f64 = rows
+            .iter()
+            .zip(weights)
+            .map(|(row, &weight)| row.loss * f64::from(weight))
+            .sum();
+        let loss = if weight_sum > 0.0 {
+            (total / weight_sum) as f32
+        } else {
+            0.0
+        };
+        self.push_output(
+            Op::CrossEntropyTiedMasked {
+                targets: targets.to_vec(),
+                stats: rows,
+                weights: weights.to_vec(),
+                weight_sum,
             },
             vec![hidden, table],
             &[],
@@ -903,76 +993,114 @@ impl Graph {
                 self.acc(inputs[0], &gx)?;
             }
             Op::CrossEntropyTied { targets, stats } => {
-                let hidden = self.data_ref(inputs[0])?;
-                let table = self.data_ref(inputs[1])?;
-                let hidden_shape = self.shape(inputs[0])?;
-                let table_shape = self.shape(inputs[1])?;
-                let (n, d) = (hidden_shape[0], hidden_shape[1]);
-                let vocab = table_shape[0];
+                let n = self.shape(inputs[0])?[0];
                 let scale = f64::from(gy[0]) / n as f64;
-                let mut table_t = vec![0.0f32; vocab * d];
-                transpose_dt(&mut table_t, table, vocab, d);
-                let mut ghidden = vec![0.0f32; n * d];
-                for_each_chunk_mut(&mut ghidden, d, |start, chunk| {
-                    let mut logits_row = vec![0.0f32; vocab];
-                    let mut weighted = vec![0.0f32; d];
-                    for (offset, row) in chunk.chunks_mut(d).enumerate() {
-                        let i = start / d + offset;
-                        let hidden_row = &hidden[i * d..(i + 1) * d];
-                        logits_row.fill(0.0);
-                        for (l, &h) in hidden_row.iter().enumerate() {
-                            let t_row = &table_t[l * vocab..(l + 1) * vocab];
-                            for (slot, &t) in logits_row.iter_mut().zip(t_row) {
-                                *slot += h * t;
-                            }
-                        }
-                        let max = stats[i].max;
-                        let inverse = (1.0 / stats[i].sum) as f32;
-                        for slot in weighted.iter_mut() {
-                            *slot = 0.0;
-                        }
-                        let target = targets[i] as usize;
-                        for (j, &l) in logits_row.iter().enumerate() {
-                            let p = f32::exp(l - max) * inverse;
-                            let t_row = &table[j * d..(j + 1) * d];
-                            for (w_slot, &t) in weighted.iter_mut().zip(t_row) {
-                                *w_slot += p * t;
-                            }
-                        }
-                        let target_row = &table[target * d..(target + 1) * d];
-                        for (slot, (w, t)) in row.iter_mut().zip(weighted.iter().zip(target_row)) {
-                            *slot = (scale * f64::from(w - t)) as f32;
-                        }
-                    }
-                });
-                let mut gtable = vec![0.0f32; vocab * d];
-                for_each_chunk_mut(&mut gtable, 8 * d, |start, chunk| {
-                    let first_row = start / d;
-                    let row_count = chunk.len() / d;
-                    for r in 0..row_count {
-                        let j = first_row + r;
-                        let t_row = &table[j * d..(j + 1) * d];
-                        let g_row = &mut chunk[r * d..(r + 1) * d];
-                        for g_slot in g_row.iter_mut() {
-                            *g_slot = 0.0;
-                        }
-                        for i in 0..n {
-                            let hidden_row = &hidden[i * d..(i + 1) * d];
-                            let l = dot_f32(hidden_row, t_row);
-                            let p = f32::exp(l - stats[i].max) * ((1.0 / stats[i].sum) as f32);
-                            let delta = if j == targets[i] as usize { scale } else { 0.0 };
-                            let coefficient = (scale * f64::from(p) - delta) as f32;
-                            for (g_slot, &h) in g_row.iter_mut().zip(hidden_row) {
-                                *g_slot += coefficient * h;
-                            }
-                        }
-                    }
-                });
+                let row_scale = vec![scale; n];
+                let (ghidden, gtable) =
+                    self.ce_backward_shared(&inputs, &targets, &stats, &row_scale)?;
                 self.acc(inputs[0], &ghidden)?;
                 self.acc(inputs[1], &gtable)?;
             }
+            Op::CrossEntropyTiedMasked {
+                targets,
+                stats,
+                weights,
+                weight_sum,
+            } => {
+                if weight_sum > 0.0 {
+                    let row_scale: Vec<f64> = weights
+                        .iter()
+                        .map(|&weight| f64::from(gy[0]) * f64::from(weight) / weight_sum)
+                        .collect();
+                    let (ghidden, gtable) =
+                        self.ce_backward_shared(&inputs, &targets, &stats, &row_scale)?;
+                    self.acc(inputs[0], &ghidden)?;
+                    self.acc(inputs[1], &gtable)?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Shared cross-entropy backward: per-row gradient scales are given by
+    /// `row_scale` (uniform `gy / n` for the plain mean, `gy * w_i / sum(w)`
+    /// for the masked variant). Gradients accumulate into `hidden` and
+    /// `table` exactly as before the refactor (bit-identical for the
+    /// unmasked path).
+    fn ce_backward_shared(
+        &self,
+        inputs: &[NodeId],
+        targets: &[u32],
+        stats: &[CeRowStat],
+        row_scale: &[f64],
+    ) -> Result<(Vec<f32>, Vec<f32>), AutodiffError> {
+        let hidden = self.data_ref(inputs[0])?;
+        let table = self.data_ref(inputs[1])?;
+        let hidden_shape = self.shape(inputs[0])?;
+        let table_shape = self.shape(inputs[1])?;
+        let (n, d) = (hidden_shape[0], hidden_shape[1]);
+        let vocab = table_shape[0];
+        let mut table_t = vec![0.0f32; vocab * d];
+        transpose_dt(&mut table_t, table, vocab, d);
+        let mut ghidden = vec![0.0f32; n * d];
+        for_each_chunk_mut(&mut ghidden, d, |start, chunk| {
+            let mut logits_row = vec![0.0f32; vocab];
+            let mut weighted = vec![0.0f32; d];
+            for (offset, row) in chunk.chunks_mut(d).enumerate() {
+                let i = start / d + offset;
+                let scale = row_scale[i];
+                let hidden_row = &hidden[i * d..(i + 1) * d];
+                logits_row.fill(0.0);
+                for (l, &h) in hidden_row.iter().enumerate() {
+                    let t_row = &table_t[l * vocab..(l + 1) * vocab];
+                    for (slot, &t) in logits_row.iter_mut().zip(t_row) {
+                        *slot += h * t;
+                    }
+                }
+                let max = stats[i].max;
+                let inverse = (1.0 / stats[i].sum) as f32;
+                for slot in weighted.iter_mut() {
+                    *slot = 0.0;
+                }
+                let target = targets[i] as usize;
+                for (j, &l) in logits_row.iter().enumerate() {
+                    let p = f32::exp(l - max) * inverse;
+                    let t_row = &table[j * d..(j + 1) * d];
+                    for (w_slot, &t) in weighted.iter_mut().zip(t_row) {
+                        *w_slot += p * t;
+                    }
+                }
+                let target_row = &table[target * d..(target + 1) * d];
+                for (slot, (w, t)) in row.iter_mut().zip(weighted.iter().zip(target_row)) {
+                    *slot = (scale * f64::from(w - t)) as f32;
+                }
+            }
+        });
+        let mut gtable = vec![0.0f32; vocab * d];
+        for_each_chunk_mut(&mut gtable, 8 * d, |start, chunk| {
+            let first_row = start / d;
+            let row_count = chunk.len() / d;
+            for r in 0..row_count {
+                let j = first_row + r;
+                let t_row = &table[j * d..(j + 1) * d];
+                let g_row = &mut chunk[r * d..(r + 1) * d];
+                for g_slot in g_row.iter_mut() {
+                    *g_slot = 0.0;
+                }
+                for i in 0..n {
+                    let hidden_row = &hidden[i * d..(i + 1) * d];
+                    let l = dot_f32(hidden_row, t_row);
+                    let p = f32::exp(l - stats[i].max) * ((1.0 / stats[i].sum) as f32);
+                    let scale = row_scale[i];
+                    let delta = if j == targets[i] as usize { scale } else { 0.0 };
+                    let coefficient = (scale * f64::from(p) - delta) as f32;
+                    for (g_slot, &h) in g_row.iter_mut().zip(hidden_row) {
+                        *g_slot += coefficient * h;
+                    }
+                }
+            }
+        });
+        Ok((ghidden, gtable))
     }
 
     fn push(&mut self, node: Node) -> NodeId {
@@ -1426,6 +1554,70 @@ mod tests {
             g.value(y).unwrap_or_else(|e| panic!("{e}")).data(),
             &[11.0, 21.0, 31.0, 41.0, 11.0, 21.0, 31.0, 41.0]
         );
+    }
+
+    #[test]
+    fn cross_entropy_tied_masked_hand_case() {
+        let mut g = Graph::new();
+        let nodes = ids(
+            &mut g,
+            &[&[3, 2], &[2, 2]],
+            &[vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![1.0, 0.0, 0.0, 1.0]],
+        );
+        let loss = g
+            .cross_entropy_tied_masked(nodes[0], nodes[1], &[0, 0, 0], &[0.0, 1.0, 0.0])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let value = g.value(loss).unwrap_or_else(|e| panic!("{e}")).data()[0];
+        assert!((value - (2.0f32).ln()).abs() < 1e-6, "got {value}");
+        g.backward(loss).unwrap_or_else(|e| panic!("{e}"));
+        let ghidden = g
+            .grad(nodes[0])
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_default();
+        assert!(ghidden[0].abs() < 1e-6 && ghidden[1].abs() < 1e-6);
+        assert!((ghidden[2] + 0.5).abs() < 1e-6);
+        assert!((ghidden[3] - 0.5).abs() < 1e-6);
+        assert!(ghidden[4].abs() < 1e-6 && ghidden[5].abs() < 1e-6);
+    }
+
+    #[test]
+    fn cross_entropy_tied_masked_mean_of_two_rows() {
+        let mut g = Graph::new();
+        let nodes = ids(
+            &mut g,
+            &[&[2, 2], &[2, 2]],
+            &[vec![0.0, 0.0, 0.0, 0.0], vec![1.0, 0.0, 0.0, 1.0]],
+        );
+        let plain = g
+            .cross_entropy_tied(nodes[0], nodes[1], &[0, 1])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let masked = g
+            .cross_entropy_tied_masked(nodes[0], nodes[1], &[0, 1], &[1.0, 1.0])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let a = g.value(plain).unwrap_or_else(|e| panic!("{e}")).data()[0];
+        let b = g.value(masked).unwrap_or_else(|e| panic!("{e}")).data()[0];
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn cross_entropy_tied_masked_rejects_bad_weights() {
+        let mut g = Graph::new();
+        let nodes = ids(
+            &mut g,
+            &[&[1, 2], &[2, 2]],
+            &[vec![0.0, 0.0], vec![1.0, 0.0, 0.0, 1.0]],
+        );
+        let zero = g
+            .cross_entropy_tied_masked(nodes[0], nodes[1], &[0], &[0.0])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            g.value(zero).unwrap_or_else(|e| panic!("{e}")).data()[0],
+            0.0
+        );
+        let negative = g.cross_entropy_tied_masked(nodes[0], nodes[1], &[0], &[-1.0]);
+        assert!(negative.is_err());
+        let wrong_len = g.cross_entropy_tied_masked(nodes[0], nodes[1], &[0], &[1.0, 1.0]);
+        assert!(wrong_len.is_err());
     }
 
     #[test]

@@ -15,7 +15,9 @@ pub struct Sequences {
 }
 
 impl Sequences {
-    pub(crate) fn from_windows(windows: &[Vec<u32>], seq_len: usize) -> Self {
+    /// Packs prepared windows (each of length `seq_len + 1`) into the flat
+    /// `x`/`y` representation. Also used by the Phase 6 SFT packing.
+    pub fn from_windows(windows: &[Vec<u32>], seq_len: usize) -> Self {
         let count = windows.len();
         let mut x = Vec::with_capacity(count * seq_len);
         let mut y = Vec::with_capacity(count * seq_len);
@@ -55,6 +57,16 @@ pub struct Packed {
 }
 
 impl Packed {
+    /// Packs prepared windows (each of length `seq_len + 1`) with the
+    /// canonical 90/10 split. Also used by the Phase 6 SFT packing.
+    pub fn from_windows(windows: &[Vec<u32>], seq_len: usize) -> Self {
+        let split = (windows.len() / 10) * 9;
+        Self {
+            train: Sequences::from_windows(&windows[..split], seq_len),
+            val: Sequences::from_windows(&windows[split..], seq_len),
+        }
+    }
+
     /// The training split (`(windows.len() / 10) * 9` leading windows).
     pub fn train(&self) -> &Sequences {
         &self.train
