@@ -5,9 +5,11 @@ transformer, causal self-attention, GELU MLP, learned absolute positions, tied
 token embedding and output projection by default. PyTorch is used only for
 tensor operations and autograd (CLAUDE.md constraint).
 
-Checkpoint policy (D-0014): every checkpoint stores step, model state, optimizer
-state, both RNG states, config, and the loss history, so a resumed run continues
-bit-for-bit on the same hardware.
+Checkpoint policy (D-0014, extended by D-0018): every checkpoint stores step,
+model state, optimizer state, both RNG states, config, and the loss history, so
+a resumed run continues bit-for-bit on the same hardware. Format
+`byva-train-checkpoint-v2` additionally stores the FP16 GradScaler state; v1
+checkpoints (no scaler) still load.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from byva_tokenizer import load_artifact, merge_ranks, encode_content
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,6 +67,22 @@ class ModelConfig:
         if not self.tie_embeddings:
             total += embedding
         return total
+
+
+TINY_CONFIG = ModelConfig(
+    d_model=256, n_layers=4, n_heads=8, ffn_hidden=1024, max_seq_len=512
+)
+SMALL_CONFIG = ModelConfig(
+    d_model=512, n_layers=8, n_heads=8, ffn_hidden=2048, max_seq_len=1024
+)
+
+
+def config_by_name(name: str) -> ModelConfig:
+    if name == "tiny":
+        return TINY_CONFIG
+    if name == "small":
+        return SMALL_CONFIG
+    raise ValueError(f"unknown config {name!r}; expected 'tiny' or 'small'")
 
 
 class CausalSelfAttention(nn.Module):
@@ -196,10 +216,11 @@ def save_checkpoint(
     model: DecoderOnlyTransformer,
     optimizer: torch.optim.Optimizer,
     state: TrainState,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "format": "byva-train-checkpoint-v1",
+        "format": "byva-train-checkpoint-v2",
         "step": state.step,
         "config": dataclasses.asdict(model.config),
         "model": model.state_dict(),
@@ -207,6 +228,7 @@ def save_checkpoint(
         "rng_torch": torch.get_rng_state(),
         "rng_python": random.getstate(),
         "loss_history": state.loss_history,
+        "scaler": scaler.state_dict() if scaler is not None else None,
     }
     torch.save(payload, path)
 
@@ -214,10 +236,13 @@ def save_checkpoint(
 def load_checkpoint(
     path: Path,
     device: torch.device | None = None,
-) -> tuple[DecoderOnlyTransformer, torch.optim.Optimizer, TrainState]:
+) -> tuple[DecoderOnlyTransformer, torch.optim.Optimizer, TrainState, torch.amp.GradScaler | None]:
     payload = torch.load(path, map_location=device or "cpu", weights_only=False)
-    if payload.get("format") != "byva-train-checkpoint-v1":
-        raise ValueError(f"unsupported checkpoint format: {payload.get('format')!r}")
+    fmt = payload.get("format")
+    if fmt not in ("byva-train-checkpoint-v1", "byva-train-checkpoint-v2"):
+        raise ValueError(f"unsupported checkpoint format: {fmt!r}")
+    if fmt == "byva-train-checkpoint-v1" and payload.get("scaler") is not None:
+        raise ValueError("v1 checkpoints must not carry scaler state")
     config = ModelConfig(**payload["config"])
     model = DecoderOnlyTransformer(config)
     model.load_state_dict(payload["model"])
@@ -228,7 +253,11 @@ def load_checkpoint(
     state = TrainState(
         step=payload["step"], loss_history=list(payload["loss_history"])
     )
-    return model, optimizer, state
+    scaler = None
+    if fmt == "byva-train-checkpoint-v2" and payload.get("scaler") is not None:
+        scaler = torch.amp.GradScaler()
+        scaler.load_state_dict(payload["scaler"])
+    return model, optimizer, state, scaler
 
 
 def evaluate(
@@ -262,40 +291,61 @@ def train(
     checkpoint_every: int = 200,
     resume: bool = False,
     generator_seed: int = 0,
+    device: torch.device | None = None,
+    use_fp16: bool = False,
+    grad_accum: int = 1,
 ) -> tuple[DecoderOnlyTransformer, TrainState]:
     """Runs the training loop; resumable when `checkpoint_path` is provided."""
     config.validate()
+    if grad_accum < 1:
+        raise ValueError("grad_accum must be at least 1")
+    device = device or torch.device("cpu")
+    if use_fp16 and device.type != "cuda":
+        raise ValueError("--fp16 requires a CUDA device")
     torch.manual_seed(generator_seed)
-    model = DecoderOnlyTransformer(config)
+    model = DecoderOnlyTransformer(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    scaler = torch.amp.GradScaler(enabled=use_fp16)
     state = TrainState(step=0, loss_history=[])
     if resume and checkpoint_path is not None and Path(checkpoint_path).exists():
-        model, optimizer, state = load_checkpoint(checkpoint_path)
+        model, optimizer, state, scaler = load_checkpoint(checkpoint_path, device)
         if model.config != config:
             raise ValueError("checkpoint config differs from requested config")
-    model.train()
+        if use_fp16 and scaler is None:
+            raise ValueError("--fp16 resume needs a v2 checkpoint with scaler state")
+        model.train()
+    train_x = train_x.to(device)
+    train_y = train_y.to(device)
     start = state.step
     for step in range(start, start + steps):
-        indices = torch.randint(0, len(train_x), (batch_size,))
-        logits = model(train_x[indices])
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)), train_y[indices].reshape(-1)
-        )
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        micro_losses: list[torch.Tensor] = []
+        for _ in range(grad_accum):
+            indices = torch.randint(0, len(train_x), (batch_size,))
+            with torch.autocast("cuda", dtype=torch.float16, enabled=use_fp16):
+                logits = model(train_x[indices])
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    train_y[indices].reshape(-1),
+                ) / grad_accum
+            scaler.scale(loss).backward()
+            micro_losses.append(loss.detach())
+        scaler.step(optimizer)
+        scaler.update()
         state.step = step + 1
-        state.loss_history.append(loss.item())
+        state.loss_history.append(
+            sum(item.item() for item in micro_losses)
+        )
         if log_every and (step + 1) % log_every == 0:
-            val_loss = evaluate(model, val_x, val_y)
+            val_loss = evaluate(model, val_x.to(device), val_y.to(device))
             print(
-                f"step {state.step}: train_loss {loss.item():.4f} "
+                f"step {state.step}: train_loss {state.loss_history[-1]:.4f} "
                 f"val_loss {val_loss:.4f}"
             )
         if checkpoint_path is not None and checkpoint_every and state.step % checkpoint_every == 0:
-            save_checkpoint(Path(checkpoint_path), model, optimizer, state)
+            save_checkpoint(Path(checkpoint_path), model, optimizer, state, scaler)
     if checkpoint_path is not None:
-        save_checkpoint(Path(checkpoint_path), model, optimizer, state)
+        save_checkpoint(Path(checkpoint_path), model, optimizer, state, scaler)
     return model, state
 
 
@@ -343,6 +393,15 @@ def byte_token_stream(texts: list[str]) -> list[int]:
     return stream
 
 
+def bpe_token_stream(texts: list[str], artifact: dict) -> list[int]:
+    """Encodes shard texts with a trained BPE artifact (production path, D-0015)."""
+    ranks = merge_ranks(artifact["merges"])
+    stream: list[int] = []
+    for text in texts:
+        stream.extend(encode_content(text, ranks))
+    return stream
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -356,22 +415,61 @@ def main() -> int:
         type=Path,
         help="train on a shard directory built by training/build_shards.py",
     )
+    parser.add_argument(
+        "--config",
+        choices=("tiny", "small"),
+        default="tiny",
+        help="frozen model configuration (D-0013)",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        default=None,
+        help="BPE artifact from training/train_bpe.py; omit for byte-level (D-0015)",
+    )
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--grad-accum", type=int, default=1)
+    parser.add_argument(
+        "--device", default="cpu", help="torch device, e.g. cuda on a T4"
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="CUDA autocast fp16 with GradScaler (requires --device cuda)",
+    )
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
-    config = ModelConfig()
+    config = config_by_name(args.config)
+    device = torch.device(args.device)
+    if args.fp16 and device.type != "cuda":
+        raise SystemExit("--fp16 requires --device cuda")
+    artifact = None
+    if args.tokenizer is not None:
+        artifact = load_artifact(args.tokenizer)
+        if artifact["vocab_size"] != config.vocab_size:
+            raise SystemExit(
+                f"tokenizer vocab_size {artifact['vocab_size']} != model vocab_size "
+                f"{config.vocab_size}"
+            )
     if args.smoke:
+        if artifact is not None:
+            raise SystemExit("--tokenizer is not valid with --smoke")
         stream = smoke_token_stream(40_000)
         seq_len = config.max_seq_len // 4
         prompt_text = None
     else:
-        stream = byte_token_stream(load_shard_texts(args.shards))
+        texts = load_shard_texts(args.shards)
+        if artifact is not None:
+            stream = bpe_token_stream(texts, artifact)
+            prompt_text = "Once upon a time"
+        else:
+            stream = byte_token_stream(texts)
+            prompt_text = "Once upon a time"
         seq_len = args.seq_len
-        prompt_text = "Once upon a time"
     train_x, train_y, val_x, val_y = make_sequences(stream, seq_len)
     model, state = train(
         config,
@@ -384,17 +482,25 @@ def main() -> int:
         log_every=50,
         checkpoint_path=args.checkpoint,
         resume=args.resume,
+        device=device,
+        use_fp16=args.fp16,
+        grad_accum=args.grad_accum,
     )
     first, last = state.loss_history[0], state.loss_history[-1]
     print(f"loss {first:.4f} -> {last:.4f} over {state.step} steps")
     if prompt_text is None:
-        prompt = torch.tensor([[64, 65, 66]])
+        prompt = torch.tensor([[64, 65, 66]], device=device)
+    elif artifact is not None:
+        prompt_ids = encode_content(prompt_text, merge_ranks(artifact["merges"]))
+        prompt = torch.tensor([prompt_ids], device=device)
     else:
-        prompt = torch.tensor([list(prompt_text.encode("utf-8"))])
+        prompt = torch.tensor([list(prompt_text.encode("utf-8"))], device=device)
     generated = model.generate(prompt, max_new_tokens=48, temperature=0.0)
     continuation = generated[0, prompt.shape[1] :].tolist()
     if prompt_text is None:
         print("greedy continuation of [64,65,66]:", continuation)
+    elif artifact is not None:
+        print("greedy continuation ids:", continuation)
     else:
         print("greedy continuation of", repr(prompt_text), "->",
               repr(bytes(continuation).decode("utf-8", errors="replace")))

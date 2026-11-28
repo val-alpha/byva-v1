@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
+pub mod trainer;
+
 pub const SPECIAL_TOKEN_COUNT: u32 = 15;
 pub const RESERVED_TOKEN_COUNT: u32 = 32;
 pub const BYTE_TOKEN_BASE: u32 = SPECIAL_TOKEN_COUNT + RESERVED_TOKEN_COUNT;
@@ -164,6 +166,18 @@ pub enum TokenizerError {
     ControlTokenInContent(u32),
     #[error("decoded bytes are not valid UTF-8")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
+    #[error("target vocabulary {0} leaves no room for merges (FIRST_MERGE_ID is 303)")]
+    TargetVocabTooSmall(u32),
+    #[error("corpus is empty")]
+    EmptyCorpus,
+    #[error(
+        "corpus exhausted: no pair occurs twice; only {trained} merges trainable, {requested} requested"
+    )]
+    CorpusExhausted { trained: usize, requested: usize },
+    #[error("artifact serialization failed: {0}")]
+    Serialization(String),
+    #[error("corpus read failed: {0}")]
+    CorpusRead(String),
 }
 
 #[derive(Debug, Clone, Copy)]

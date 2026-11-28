@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,7 +42,7 @@ class ShardConfig:
     max_chars: int = DEFAULT_MAX_CHARS
 
 
-def load_documents(path: Path) -> list[str]:
+def load_documents(path: Path, progress_every: int | None = None) -> list[str]:
     documents: list[str] = []
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -55,11 +56,13 @@ def load_documents(path: Path) -> list[str]:
             if not isinstance(record, dict) or not isinstance(record.get("text"), str):
                 raise DataError(f"{path}:{line_number}: record must be an object with a text field")
             documents.append(record["text"])
+            if progress_every is not None and len(documents) % progress_every == 0:
+                print(f"  {path.name}: {len(documents)} docs loaded", file=sys.stderr, flush=True)
     return documents
 
 
 def prepare_documents(
-    raw_texts: list[str], config: ShardConfig
+    raw_texts: list[str], config: ShardConfig, progress_every: int | None = None
 ) -> tuple[list[dict], dict]:
     """Normalize, filter, and deduplicate. Returns (docs, stats).
 
@@ -73,20 +76,26 @@ def prepare_documents(
         "dropped_duplicates": 0,
     }
     kept: list[dict] = []
-    for text in raw_texts:
+    for index, text in enumerate(raw_texts):
         normalized = normalize_text(text)
         if len(normalized) < config.min_chars:
             stats["dropped_short"] += 1
-            continue
-        if len(normalized) > config.max_chars:
+        elif len(normalized) > config.max_chars:
             stats["dropped_long"] += 1
-            continue
-        digest = doc_hash(normalized)
-        if digest in seen:
-            stats["dropped_duplicates"] += 1
-            continue
-        seen.add(digest)
-        kept.append({"id": digest[:16], "text": normalized})
+        else:
+            digest = doc_hash(normalized)
+            if digest in seen:
+                stats["dropped_duplicates"] += 1
+            else:
+                seen.add(digest)
+                kept.append({"id": digest[:16], "text": normalized})
+        if progress_every is not None and (index + 1) % progress_every == 0:
+            print(
+                f"  prepare: {index + 1}/{len(raw_texts)} docs "
+                f"(kept {len(kept)}, dup {stats['dropped_duplicates']})",
+                file=sys.stderr,
+                flush=True,
+            )
     kept.sort(key=lambda doc: doc["id"])
     stats["kept"] = len(kept)
     return kept, stats

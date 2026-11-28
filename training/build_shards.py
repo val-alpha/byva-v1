@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -25,6 +26,14 @@ from byva_data import (
     shard_bytes,
     shard_documents,
 )
+
+
+PROGRESS_EVERY = 50_000
+
+
+def _elapsed(start: float) -> str:
+    seconds = int(time.monotonic() - start)
+    return f"[{seconds // 60:02d}:{seconds % 60:02d}]"
 
 
 def main() -> int:
@@ -46,21 +55,52 @@ def main() -> int:
         max_chars=args.max_chars,
     )
 
+    start = time.monotonic()
     raw_texts: list[str] = []
     for source in args.input:
-        raw_texts.extend(load_documents(source))
+        print(f"{_elapsed(start)} loading {source.name} ...", file=sys.stderr, flush=True)
+        loaded_before = len(raw_texts)
+        raw_texts.extend(load_documents(source, progress_every=PROGRESS_EVERY))
+        print(
+            f"{_elapsed(start)} loaded {len(raw_texts) - loaded_before} docs from {source.name}",
+            file=sys.stderr,
+            flush=True,
+        )
 
-    docs, stats = prepare_documents(raw_texts, config)
+    print(
+        f"{_elapsed(start)} normalizing, filtering, deduplicating {len(raw_texts)} docs ...",
+        file=sys.stderr,
+        flush=True,
+    )
+    docs, stats = prepare_documents(raw_texts, config, progress_every=PROGRESS_EVERY)
+    del raw_texts
     shards = shard_documents(docs, config)
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     written: list[tuple[str, bytes]] = []
+    skipped = 0
     for index, shard in enumerate(shards):
         name = f"shard-{index:05d}.jsonl"
         payload = shard_bytes(shard)
-        (output_dir / name).write_bytes(payload)
+        target = output_dir / name
+        if target.is_file() and target.stat().st_size == len(payload):
+            skipped += 1
+        else:
+            target.write_bytes(payload)
         written.append((name, payload))
+        if (index + 1) % 100 == 0:
+            print(
+                f"{_elapsed(start)}   writing shards: {index + 1}/{len(shards)}",
+                file=sys.stderr,
+                flush=True,
+            )
+    if skipped:
+        print(
+            f"{_elapsed(start)} resumed: {skipped} shards already present, {len(shards) - skipped} written",
+            file=sys.stderr,
+            flush=True,
+        )
 
     manifest = build_manifest(args.input, written, config)
     manifest["stats"] = stats
@@ -72,6 +112,7 @@ def main() -> int:
     print(f"docs kept: {stats['kept']} / {stats['input']}")
     print(f"shards written: {len(shards)} -> {output_dir}")
     print(f"manifest: {manifest_path}")
+    print(f"total time: {_elapsed(start).strip('[]')}")
     return 0
 
 

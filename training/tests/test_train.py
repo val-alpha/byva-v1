@@ -171,6 +171,81 @@ class TrainingTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_checkpoint(path)
 
+    def test_v1_checkpoint_still_loads(self):
+        train_x, train_y, val_x, val_y = smoke_train_x_y()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "v1.pt"
+            payload = {
+                "format": "byva-train-checkpoint-v1",
+                "step": 4,
+                "config": dataclasses.asdict(TINY),
+                "model": DecoderOnlyTransformer(TINY).state_dict(),
+                "optimizer": torch.optim.AdamW(
+                    DecoderOnlyTransformer(TINY).parameters(), lr=1e-3
+                ).state_dict(),
+                "rng_torch": torch.get_rng_state(),
+                "rng_python": __import__("random").getstate(),
+                "loss_history": [1.0, 0.9],
+            }
+            torch.save(payload, path)
+            model, _, state, scaler = load_checkpoint(path)
+            self.assertIsNone(scaler)
+            self.assertEqual(state.step, 4)
+
+    def test_grad_accum_resume_matches_uninterrupted_run(self):
+        train_x, train_y, val_x, val_y = smoke_train_x_y()
+        _, reference_state = train(
+            TINY, train_x, train_y, val_x, val_y,
+            steps=24, log_every=0, batch_size=4, grad_accum=2,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ckpt.pt"
+            _, interrupted = train(
+                TINY, train_x, train_y, val_x, val_y,
+                steps=12, log_every=0, batch_size=4, grad_accum=2,
+                checkpoint_path=path, checkpoint_every=6,
+            )
+            _, resumed_state = train(
+                TINY, train_x, train_y, val_x, val_y,
+                steps=12, log_every=0, batch_size=4, grad_accum=2,
+                checkpoint_path=path, checkpoint_every=6, resume=True,
+            )
+        self.assertEqual(resumed_state.step, 24)
+        self.assertEqual(resumed_state.loss_history, reference_state.loss_history)
+
+    def test_fp16_requires_cuda(self):
+        train_x, train_y, val_x, val_y = smoke_train_x_y()
+        with self.assertRaises(ValueError):
+            train(
+                TINY, train_x, train_y, val_x, val_y,
+                steps=1, log_every=0, batch_size=4, use_fp16=True,
+            )
+
+    def test_bpe_token_stream_trains_and_decodes(self):
+        from byva_tokenizer import FIRST_MERGE_ID, decode_content, merge_ranks
+        from byva_tokenizer import encode_content
+        from train import bpe_token_stream
+        from train_bpe import train_bpe
+
+        texts = [
+            "bola bola bola voli voli voli data data data",
+            "mata mata mata litera litera litera lunar lunar",
+        ] * 40
+        artifact = train_bpe(texts[:2], target_vocab=FIRST_MERGE_ID + 16)
+        ranks = merge_ranks(artifact["merges"])
+        for text in texts[:2]:
+            self.assertEqual(
+                decode_content(encode_content(text, ranks), artifact["merges"]), text
+            )
+        stream = bpe_token_stream(texts, artifact)
+        self.assertTrue(all(0 <= token < 32_768 for token in stream))
+        train_x, train_y, val_x, val_y = make_sequences(stream, 64)
+        config = ModelConfig(d_model=64, n_layers=2, n_heads=8, ffn_hidden=128, max_seq_len=64)
+        _, state = train(
+            config, train_x, train_y, val_x, val_y, steps=20, log_every=0, batch_size=8
+        )
+        self.assertLess(state.loss_history[-1], state.loss_history[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -114,32 +114,19 @@ Add dated entries for material decisions. Record superseded decisions rather tha
 - Rationale: A small (~42M) model has limited capacity; concentrating it on two languages maximizes measured quality, Indonesian is the project's primary audience, and English data provides the strongest public capability signal that transfers.
 - Consequences: Mixture weights (id:en ratio) are decided per training run and recorded in the run manifest; added sources must fit the two-language scope or be rejected. OSCAR-2301 sampling is blocked on Hub authentication (HTTP 401) and stays pending until an HF token is provided.
 
-## D-0017 — Deterministic BPE training and artifact storage
-
+## D-0017 — BPE trainer determinism contract and Python tokenizer mirror
 - Status: Accepted
-- Date: 2026-11-28
-- Decision: The tokenizer vocabulary is trained by `training/train_bpe.py` on
-  Phase 2 shards. Documents are pre-tokenized with a fixed Unicode-class regex
-  (letter runs, digit runs, whitespace runs, single other characters), reduced
-  to sorted word-type frequencies, and merges are selected greedily with
-  tie-breaking (highest pair count, then lowest left token id, then lowest
-  right token id), so a given document set yields a byte-identical artifact.
-  The trained 32,768-vocab artifact and its training manifest are committed
-  under `artifacts/tokenizer/` as source-derived data — not a corpus,
-  checkpoint, or model binary.
-- Rationale: D-0015 requires a trained 32k BPE table before production
-  pretraining. The training corpus is a datasets-server sample that can drift
-  between retrievals, so byte-identical regeneration cannot be guaranteed;
-  committing the small JSON artifact and validating it in Rust CI keeps the
-  production vocabulary stable and auditable.
-- Consequences: `crates/tokenizer/tests/bpe_artifact.rs` loads the committed
-  artifact and would fail on drift. Any retraining (e.g., on full-corpus
-  shards during the Colab scale-up) must record a new training manifest and
-  either supersede the artifact under a new version/name or reproduce the
-  existing one exactly. `training/train.py` still encodes byte ids until it
-  gains `--tokenizer` support, after which production pretraining consumes
-  only the trained artifact (D-0015).
+- Date: 2026-11-27
+- Decision: The 32,768-merge BPE table is trained by `training/train_bpe.py` (pure stdlib) directly on Phase 2 shard documents with no pre-tokenization boundary, matching `Tokenizer::encode_bytes`. Determinism is contractual: pair counts are aggregated over the document set (input order never matters), each step merges the pair with the highest count, ties broken by (left, right) ascending, and occurrences are replaced left-to-right without overlap. `training/byva_tokenizer.py` mirrors the Rust encode/decode/validate semantics for training-time use, and a golden artifact trained on the smoke fixture (`crates/tokenizer/tests/golden/bpe_smoke_v1.json`) must regenerate byte-identically in Python and round-trip through the Rust tokenizer in CI.
+- Rationale: Training/serve segment mismatch would silently corrupt the model; D-0015 makes the trained table a prerequisite for the real T4 run, so its determinism must be pinned cross-language now.
+- Consequences: Any change to the Rust encoder or the Python mirror that alters segmentation must update both sides and regenerate the golden fixture in the same commit. The exact incremental trainer is memory-bounded (index scales with corpus size); corpora beyond a few tens of MB need a scaled trainer before the 32k table can be trained on them — recorded as an open Phase 3/8 hardware item.
 
+## D-0018 — Checkpoint format v2: FP16 GradScaler state, fp16 and gradient-accumulation training
+- Status: Accepted
+- Date: 2026-11-27
+- Decision: `byva-train-checkpoint-v2` extends v1 with the GradScaler state (null when FP16 is off); the loader accepts v1 and v2 and rejects unknown formats. The reference trainer gains `--config {tiny,small}` (frozen D-0013 configurations), `--tokenizer <artifact>` (production BPE path; byte-level stays the explicit fallback per D-0015), `--device`, `--fp16` (CUDA autocast + GradScaler), and `--grad-accum N` (per-micro-batch backward, loss history records the accumulated mean cross-entropy so it is comparable across accumulation factors).
+- Rationale: The T4 gate requires a real FP16 run of the SMALL config, and Colab sessions die mid-run; a resumed run that drops scaler state would fork the loss trajectory exactly like lost RNG state.
+- Consequences: Phase 4 conversion must accept v2 checkpoints; resuming an FP16 run requires a v2 checkpoint (v1 loads only for FP32). Any further field addition bumps the format again per D-0014.
 ## D-0019 — CPU-first performance budget and quality guardrails
 
 - Status: Accepted
@@ -162,3 +149,19 @@ Add dated entries for material decisions. Record superseded decisions rather tha
   unsafe (D-0006); first measured CPU decode numbers are recorded in
   docs/PERFORMANCE.md when Phase 5 lands; budgets may be revised only with
   measured evidence, never by editing the target silently.
+
+## D-0020 — Reconciliation of the parallel BPE trainers; exact byte-level trainer is canonical
+
+- Status: Accepted
+- Date: 2026-11-28
+- Decision: Two BPE trainers had evolved in parallel (`byva/implementation` f81c36d: word-type pre-tokenized trainer with a committed artifact; this branch: exact byte-level trainer matching `Tokenizer::encode_bytes`). The exact byte-level trainer is canonical because the Rust tokenizer serves through `encode_bytes` (no pre-tokenization), so training/serve segmentation is identical by construction (extends D-0017). The word-type trainer variant, its tests (`training/tests/test_bpe.py`), and its mini fixture are removed. The committed 32,768 artifact produced by the superseded trainer stays in place (it remains a valid table under byte-level serving) only until it is retrained by the canonical trainer and replaced together with a new training manifest (D-0007/D-0012 provenance rules apply).
+- Rationale: two live trainers with a duplicated D-0017 would let training and serving segmentation drift; the serving side is the fixed point, so the trainer must follow it.
+- Consequences: all future vocabulary training uses the canonical trainer path (scaled Rust trainer for large corpora, D-0021); any trainer change must keep the cross-language golden fixture byte-identical; artifact replacement requires a new manifest and updated Rust integration tests in the same commit.
+
+## D-0021 — Scaled Rust trainer for production corpora
+
+- Status: Accepted
+- Date: 2026-11-28
+- Decision: The canonical exact trainer (D-0017/D-0020) gains a memory-bounded Rust implementation, `byva_tokenizer::trainer::train_bpe` (CLI `cargo run --release -p byva-tokenizer --bin train_bpe`), used for all training corpora beyond a few tens of MB where the pure-Python trainer exhausts RAM. It is contractually identical to the Python trainer: aggregated pair counts over the document set, (count desc, left asc, right asc) selection, occurrences replaced in ascending (document, index) order without overlap, and pairs below two occurrences are not mergeable. Documents are `u32` symbol arrays; pair positions are packed (document, index) `u64` entries in per-pair sets, with a stale-tolerant candidate heap that is compacted when it exceeds four times the live pair count plus a fixed slack. Cross-language equivalence is pinned by the golden fixture (byte-identical artifact) and was verified byte-identical against the Python trainer on a 2.77 MB shard sample at the full 32,768 vocabulary; the Python trainer remains the readable reference definition of the contract.
+- Rationale: the Python exact trainer peaked near the sandbox RAM ceiling on a 20 MB corpus, so the 99 MB local corpus (and later full shards) cannot train in Python; a second implementation only stays safe if byte-identity is enforced, not assumed.
+- Consequences: any change to either trainer must keep the golden fixture byte-identical and re-verify cross-language equivalence on a multi-hundred-merge corpus; the Rust trainer's input JSONL is NFC-normalized at read time, matching `load_shard_texts`; production artifact retraining (D-0020) uses this trainer.

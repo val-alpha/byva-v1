@@ -1,1 +1,52 @@
-{"artifact":"byva-tokenizer-v1.json","artifact_sha256":"bb380795929e6ff89e3437ce1590928454727759bbec78a4e37f255d27b6cd77","config":{"min_pair_count":2,"pretokenizer":"regex:[^\\W\\d_]+|\\d+|\\s+|. (Unicode letter runs, digit runs, whitespace runs, single other characters)","target_merges":32465,"tie_break":"highest pair count, then lowest left token id, then lowest right token id","vocab_size":32768},"corpus":{"docs":5288,"kind":"phase2-shards","manifest_sha256":"f2e672d0c05c2a47b240177e101eebde8dd710c0f69e382b8e708a0d4ca124ef","sources":[{"name":"c4-id.jsonl","sha256":"89bc8345f5a5f638b3ba10b3aee2f08d37c789d2c5250e77cc9beab099af5a41"},{"name":"fineweb-edu.jsonl","sha256":"fe574043a408e6237ad5285e7d36ebd79b3764dbb2a1d16a56f2f7a181b81d5b"},{"name":"tinystories.jsonl","sha256":"e79f060d4c295705348be2da522ab4d9a75ba54b3aa48d5b9ad4293341e802db"},{"name":"wiki-en.jsonl","sha256":"feefcf4820186d077a722fbfb57e9e7b233b00e0769275006e9e6087391c668b"},{"name":"wiki-id.jsonl","sha256":"c2f4a9aa7cb2afbf39e2fb88775fc0049d08663ebbf0e08cd9c3962f15ff768e"}]},"schema_version":1,"stats":{"byte_instances":41366863,"token_instances":14816989,"word_instances":13706739,"word_types":244687},"training_seconds":32}
+{
+  "artifact": "byva-tokenizer-v1.json",
+  "artifact_sha256": "510662d736dd81d9e6008b58366d31794efc34b9bd222132791f6fc8512829dc",
+  "config": {
+    "min_pair_count": 2,
+    "pretokenizer": "none (byte-level, matches Tokenizer::encode_bytes)",
+    "target_merges": 32465,
+    "tie_break": "highest pair count, then lowest left token id, then lowest right token id",
+    "trainer": "byva-tokenizer --bin train_bpe (scaled Rust trainer, D-0021)",
+    "vocab_size": 32768
+  },
+  "corpus": {
+    "bytes": 97930272,
+    "docs": 9962,
+    "kind": "phase2-shards",
+    "manifest_sha256": "a5470153c2421e725b71f3d7bb294869f5637db72d2774fac4779fb13c89a2a7",
+    "normalization": "NFC",
+    "sources": [
+      {
+        "name": "c4_id.jsonl",
+        "sha256": "7a02e949a7fe173e9a97a4beb0325b136a789a24e691111098b64a4df86a281c"
+      },
+      {
+        "name": "fw2_id.jsonl",
+        "sha256": "d05d31d31b61654edff6ddecd80cca356a72a97d5b1462f7fd982869597d33b0"
+      },
+      {
+        "name": "fw_edu_en.jsonl",
+        "sha256": "5614e7166a9f54ef15d3c96e037c6871811f001885cc6eaf6d38887f28a751c9"
+      },
+      {
+        "name": "wiki_en.jsonl",
+        "sha256": "34094f6a54d8bea27f6983899209372dbd326231cad15edf7ce3443308dc2909"
+      },
+      {
+        "name": "wiki_id.jsonl",
+        "sha256": "978c39a622901819c67499f3a421a4b9f5275a646f68a26e84bc3abfd200d4dd"
+      }
+    ]
+  },
+  "decision_refs": [
+    "D-0017",
+    "D-0020",
+    "D-0021"
+  ],
+  "runs_deterministic": "two independent runs produced byte-identical artifacts",
+  "stats": {
+    "bytes_per_token": 5.0107,
+    "token_instances": 19544088
+  },
+  "training_seconds": 77
+}

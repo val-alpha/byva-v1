@@ -121,7 +121,16 @@ Second real-dataset smoke run (same tiny config, byte-level, CPU):
   outside this environment.
 - **OSCAR-2301 sample** — gated dataset (HTTP 401); needs HF authentication.
 
-## Addendum (2026-11-28): BPE vocabulary trained (D-0017)
+## Addendum (2026-11-28): BPE vocabulary trained — SUPERSEDED by D-0020
+
+> **Status after the D-0020 reconciliation:** this addendum records the run of
+> the word-type pre-tokenized trainer variant, which was trained against a
+> regex pre-tokenization while the Rust tokenizer serves through
+> `encode_bytes` (byte-level, no pre-tokenization). The exact byte-level
+> trainer is canonical, this trainer variant has been removed together with
+> its Python tests, and its committed artifact is kept only until the
+> canonical trainer replaces it (see the 2026-11-28 local-run addendum and
+> D-0020). The numbers below stay here as the recorded history of that run.
 
 The 32,768-vocabulary BPE table required by D-0015 now exists.
 
@@ -143,15 +152,14 @@ The 32,768-vocabulary BPE table required by D-0015 now exists.
 - Committed artifacts: `artifacts/tokenizer/byva-tokenizer-v1.json`
   (sha256 `bb380795929e6ff89e3437ce1590928454727759bbec78a4e37f255d27b6cd77`)
   and its training manifest `byva-tokenizer-v1.manifest.json`.
-- Validation actually run on this commit: new Rust integration test
+- Validation actually run on that commit: new Rust integration test
   `crates/tokenizer/tests/bpe_artifact.rs` (5 tests: artifact loads under the
   published vocab bounds, bilingual round trips, compression, all 32,465
-  merges expand to bytes, control IDs stay outside content decoding) and
-  Python suite `training/tests/test_bpe.py` (12 tests including a frozen mini
-  fixture and a committed-artifact guard).
-- Still open: `training/train.py` continues to encode byte ids (D-0015);
-  wiring `--tokenizer` support into the trainer is the next step before the
-  real T4 run, so production pretraining consumes only this artifact.
+  merges expand to bytes, control IDs stay outside content decoding) and the
+  word-trainer Python suite (12 tests, since removed with the superseded
+  trainer per D-0020).
+- Still open: resolved on this branch — `train.py` gained `--tokenizer`
+  (D-0018), so production pretraining consumes a trained artifact.
 
 ## CI
 
@@ -167,3 +175,149 @@ recorded here instead.
 - `cargo test --workspace --all-targets`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 - `cargo check --manifest-path fuzz/Cargo.toml`
+
+## Session addendum (2026-11-27, CPU sandbox): BPE trainer + Colab notebook
+
+### What was implemented and run
+
+- `training/train_bpe.py` — deterministic byte-level BPE trainer (pure stdlib,
+  D-0017): trains directly on shard documents with no pre-tokenization
+  boundary; incremental pair counts with lazy heap selection, tie-break
+  (count desc, left asc, right asc); emits a versioned artifact loadable by
+  `Tokenizer::from_artifact`.
+- `training/byva_tokenizer.py` — Python mirror of the Rust tokenizer
+  (NFC + ranked merges via the same lazy-heap algorithm, validation, decode via
+  merge-child expansion) used by the trainer and trainer tests.
+- `training/train.py` extended (D-0018): `--config {tiny,small}`,
+  `--tokenizer <artifact>` (production BPE path), `--device`, `--fp16`
+  (CUDA autocast + GradScaler), `--grad-accum N`; checkpoint format bumped to
+  `byva-train-checkpoint-v2` storing GradScaler state (v1 still loads).
+- `training/colab_t4.ipynb` — Colab T4 notebook: build shards → train the
+  32,768 BPE table → SMALL FP16 run with grad accumulation and Drive-backed
+  resumable checkpoints → print gate evidence.
+
+### Tests actually run in this session
+
+- `python3 -m unittest tests.test_train_bpe` — 12 tests PASS (artifact shape,
+  naive-BPE equivalence, merge order, permutation determinism, exhaustion and
+  bounds errors, end-to-end via build_shards, golden regression, control-id
+  rejection).
+- `cargo test -p byva-tokenizer --test golden` — 3 tests PASS including the new
+  cross-language round-trip: the Python-trained golden fixture
+  (`crates/tokenizer/tests/golden/bpe_smoke_v1.json`, 64 merges) loads into the
+  Rust tokenizer and round-trips the fixture texts exactly.
+- `python3 -m unittest discover -s training/tests` — 31 tests PASS (PyTorch
+  2.15.0+cpu installed in this session, same version as the original Phase 3
+  environment): all BPE trainer tests plus the torch suite, including the new
+  grad-accumulation resume bit-for-bit test, checkpoint v2 save/load with v1
+  backward compatibility, the fp16-requires-CUDA guard, and a BPE-token-stream
+  training run with falling loss.
+- `python3 training/train.py --smoke --steps 60` — PASS (CLI end-to-end after
+  the D-0018 changes: loss 10.4615 → 0.0422, learned pattern regenerated).
+
+### Still open for the Phase 3 gate
+
+- Real T4 training run (SMALL, FP16, grad accumulation) — notebook ready; run
+  it in Colab and record evidence here.
+- The 32,768 BPE table itself is NOT yet trained: no Phase 2 full-corpus
+  shards exist in this environment, and the exact trainer is memory-bounded;
+  train it in Colab per the notebook (or a future scaled trainer, D-0017).
+
+## Addendum (2026-11-28): local CPU training run — Colab deferred by user decision
+
+The Colab T4 route was deferred by user decision after repeated mid-run
+interruptions of the shard-build cell (three runs recorded in PR #1
+comments). A real training run was executed locally instead, on the same
+trainer code path the notebook uses.
+
+### Environment
+
+- Sandbox CPU: 5 cores, 5 GB RAM, PyTorch 2.15.0+cpu (fp32, 5 threads).
+- Nothing corpus- or checkpoint-related enters Git (D-0007).
+
+### Corpus (same five verified sources as the notebook, 60:40 id:en)
+
+- wikipedia 20231101.id 2,400 / c4 id 2,400 / fineweb-2 ind_Latn 1,200 /
+  wikipedia 20231101.en 2,400 / fineweb-edu sample-10BT 1,600 = 10,000 docs,
+  ~99 MB via the HF datasets-server.
+- `build_shards.py`: 9,962 docs kept, 10 shards, manifest verified.
+
+### Tokenizer (exact trainer, D-0017/D-0018 semantics)
+
+- Trained on a 2.77 MB subsample (519 docs, ~0.6 MB per source): the exact
+  trainer's documented memory bound (occurrence-index scaling) was confirmed
+  empirically — 20 MB OOM-killed at ~3.8 GB RSS, 2.77 MB peaked at ~1.2 GB.
+- Result: 32,465 merges (vocab 32,768) in 162 s; trainer stats: 5.53
+  bytes/token on its own corpus.
+- Caveat: subsample-trained table; compression is weaker than a
+  full-corpus table would be. A memory-bounded scaled trainer remains the
+  open item for production.
+
+### Model training (TINY, D-0013: 11,670,016 params, verified from checkpoint)
+
+- `train.py --config tiny --tokenizer <artifact> --device cpu --steps 200
+  --seq-len 128 --batch-size 8`: 296 s wall clock (~1.1 s/step after a
+  ~200 s corpus encode).
+- Loss: train 10.4658 → 9.2745; val 9.1688 → 8.9338, monotone decreasing.
+- Resume verified per D-0014: `--resume` +10 steps continued 200 → 210 with
+  val loss 8.9338 → 8.8407; checkpoint v2 (140 MB) reloads config, model,
+  optimizer, scaler, and loss history.
+
+### Gate status after this run
+
+- "Real training run with the 32,768-vocab BPE tokenizer": DONE at smoke
+  scale on CPU (TINY). The Phase 3 T4/SMALL gate item is superseded by user
+  decision to defer Colab, not passed; revisit when GPU access returns.
+- Still open: full-corpus shards, production-scale BPE training, SMALL run.
+
+## Full-corpus local run (2026-11-28, session 2): scaled Rust trainer + TINY 2,000 steps
+
+### Scaled Rust trainer (D-0021)
+
+- Root-caused the cross-language divergence flagged by the 340-step probe: the
+  Python trainer replaces occurrences in `sorted(...)` (ascending document,
+  index) order while the first Rust version iterated a hash-set snapshot in
+  arbitrary order, so overlapping occurrences of the same pair applied in a
+  different order and counts drifted (the observed `('0',' ')` over-decrement).
+  Fixed by sorting the snapshot; a debug hook added during the investigation
+  was removed.
+- Retrained the production 32,768 artifact on the FULL local shard corpus
+  (9,962 docs, 97.9 MB): **5.01 bytes/token** (vs 5.53 on the 2.77 MB
+  subsample). 77 s per run on CPU; two independent runs byte-identical
+  (determinism verified).
+- Memory: the Python trainer OOM-kills on this machine around 20 MB of corpus
+  (cgroup ceiling 4.2 GB); the Rust trainer trains the 99 MB corpus in
+  ~1.5-2 GB RSS via u16 symbols, exact-capacity position vectors, and lazily
+  pruned position buckets (`crates/tokenizer/src/trainer.rs`).
+- Cross-language equivalence re-verified byte-identical at full 32k vocabulary
+  on the 2.77 MB shard sample plus the golden fixture tests (6/6).
+- Production artifact + provenance manifest (D-0007/D-0012) replaced in the
+  same commit; `bpe_artifact` integration tests 5/5 on the new table.
+
+### Model training (TINY on the new 32k table)
+
+- `train.py --config tiny --tokenizer artifacts/tokenizer/byva-tokenizer-v1.json
+  --device cpu --steps 2000 --seq-len 128 --batch-size 8`: ~34 min wall clock,
+  loss train 10.4575 -> 8.0682, val 8.0478 (monotone decrease; the earlier
+  200-step run peaked at 8.93).
+- Resume verified per D-0014/D-0018: `--resume` continued the v2 checkpoint
+  2,000 -> 2,800 steps with the loss history connected (8.05 -> ~7.7); config,
+  RNG states, optimizer, and scaler all reload.
+- Degenerate greedy continuation (single repeated token) is expected at this
+  scale and is covered by the dedicated generation unittest.
+
+### Decode baseline (proxy, NOT the D-0019 claim)
+
+- `training/bench_decode.py` (new): PyTorch reference TINY, fp32, greedy,
+  single thread, no KV cache: **26.6 tok/s median** (128 + 128 tokens).
+  The D-0019 budget (TINY >= 200 tok/s) is claimed only by the Rust runtime
+  with the Phase 7 harness; see docs/PERFORMANCE.md.
+
+### Gate status after this run
+
+- "Full-corpus shards + production-scale BPE training": DONE locally (99 MB,
+  Rust trainer, D-0021).
+- TINY long-run training with the production tokenizer: DONE locally
+  (2,000+ steps, resume verified).
+- Still open: SMALL/GPU run (Colab deferred), Phase 5 Rust runtime vs the
+  200 tok/s budget.
