@@ -35,7 +35,8 @@ const fn usage() -> &'static str {
 --prompt <text> [--max-new <count>]\n       byva-cli convert --checkpoint <training checkpoint> --out <byva-weights-v1 file>\n       byva-cli train --shards <dir with manifest.json> --tokenizer <artifact.json> --out <checkpoint> \
 [--resume] [--steps <count>] [--optimizer adamw|signtrust] [--token-budget <tokens>] \
 [--seq-len <n>] [--d-model <n>] [--layers <n>] [--heads <n>] [--ffn <n>] [--vocab <n>] \
-[--seed <n>] [--lr <f64>] [--warmup <steps>] [--eval-every <steps>] [--log-every <steps>]"
+[--seed <n>] [--lr <f64>] [--warmup <steps>] [--eval-every <steps>] [--log-every <steps>] \
+[--floor-ratio <f64>] [--weight-decay <f64>] [--save-init <checkpoint>]"
 }
 
 fn value_at(args: &[String], flag: &str, index: &mut usize) -> Result<String, String> {
@@ -199,6 +200,9 @@ fn train(args: &[String]) -> Result<(), String> {
     let mut warmup_steps: u64 = 0;
     let mut eval_every: u64 = 50;
     let mut log_every: u64 = 10;
+    let mut floor_ratio: f64 = 0.1;
+    let mut weight_decay: f64 = 0.0;
+    let mut save_init_path: Option<PathBuf> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -297,6 +301,21 @@ fn train(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| format!("--warmup requires a number; {}", usage()))?;
             }
+            "--floor-ratio" => {
+                let raw = value_at(args, "--floor-ratio", &mut index)?;
+                floor_ratio = raw
+                    .parse()
+                    .map_err(|_| format!("--floor-ratio requires a number; {}", usage()))?;
+            }
+            "--weight-decay" => {
+                let raw = value_at(args, "--weight-decay", &mut index)?;
+                weight_decay = raw
+                    .parse()
+                    .map_err(|_| format!("--weight-decay requires a number; {}", usage()))?;
+            }
+            "--save-init" => {
+                save_init_path = Some(PathBuf::from(value_at(args, "--save-init", &mut index)?));
+            }
             "--eval-every" => {
                 let raw = value_at(args, "--eval-every", &mut index)?;
                 eval_every = raw
@@ -356,20 +375,26 @@ fn train(args: &[String]) -> Result<(), String> {
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
-            weight_decay: 0.0,
+            weight_decay,
             clamp_min: 0.25,
             clamp_max: 4.0,
             steps,
             token_budget,
             seed,
             warmup_steps,
-            floor_ratio: 0.1,
+            floor_ratio,
             eval_every,
             eval_rows: 200,
         };
         Trainer::new(config, packed.train().clone(), packed.val().clone())
             .map_err(|error| error.to_string())?
     };
+    if let Some(init_path) = save_init_path {
+        trainer
+            .save(&init_path)
+            .map_err(|error| error.to_string())?;
+        eprintln!("init checkpoint: {}", init_path.display());
+    }
 
     let total = trainer.config().steps;
     let mut trained = 0u64;

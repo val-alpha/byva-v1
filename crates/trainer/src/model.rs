@@ -81,6 +81,8 @@ pub fn build_layout(config: &ModelConfig) -> Result<ParamLayout, TrainerError> {
         push(&format!("blocks.{layer}.mlp.0.weight"), &[config.ffn, d])?;
         push(&format!("blocks.{layer}.mlp.2.weight"), &[d, config.ffn])?;
     }
+    push("final_norm.weight", &[d])?;
+    push("final_norm.bias", &[d])?;
     Ok(ParamLayout {
         specs,
         total: offset,
@@ -99,7 +101,7 @@ pub fn init_params(
     let mut params = vec![0.0f32; layout.total];
     for spec in &layout.specs {
         let slot = &mut params[spec.offset..spec.offset + spec.len];
-        if spec.name.ends_with(".weight") && spec.name.contains(".norm_") {
+        if spec.name.ends_with(".weight") && spec.name.contains("norm") {
             slot.fill(1.0);
         } else if spec.name.ends_with(".bias") {
             slot.fill(0.0);
@@ -225,5 +227,8 @@ pub fn forward(
         x = graph.add(x, projected)?;
     }
 
-    Ok(graph.cross_entropy_tied(x, token_embedding, targets)?)
+    let final_gain = find("final_norm.weight")?;
+    let final_bias = find("final_norm.bias")?;
+    let final_normed = graph.layer_norm(x, final_gain, final_bias, 1e-5)?;
+    Ok(graph.cross_entropy_tied(final_normed, token_embedding, targets)?)
 }

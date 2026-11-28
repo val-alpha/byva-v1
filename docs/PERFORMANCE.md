@@ -126,3 +126,29 @@ Notes:
 - Dataset/shard benchmarks: Phase 2 and later.
 - SIMD and quantized-path numbers: the int8/int4 paths and SIMD backends are
   Phase 7 work behind the D-0023 backend interface.
+
+## Trainer step baseline: PyTorch reference vs ne2410 Rust trainer (R4, D-0022)
+
+- Date: 2026-11-28
+- Toolchain: torch 2.15.0+cpu (5 threads, Python 3.12.14); Rust release build
+  (rustc 1.100.0), scalar fp32 autodiff tape, one graph per step
+- CPU: Intel(R) Xeon(R) 6985P-C @ 2.30GHz, 5 cores visible to the sandbox
+- Config: TINY (D-0013, 11,670,016 params), seq 128, batch 8, exactly 1024
+  tokens/step, AdamW lr 1e-3 / weight decay 1e-2 / eps 1e-8 / betas 0.9+0.999
+- Parity context: same shards, same initial weights, same explicit batches;
+  max abs loss diff 1.237e-06 over 4 steps, max abs final-weight diff
+  8.36e-05 (harness: `training/parity_rust_ne2410.py`)
+
+| Trainer | s/step | Notes |
+|---|---|---|
+| PyTorch reference (`training/train.py` math) | **0.386** | median-of-run mean over 4 steps; BLAS-backed |
+| ne2410 Rust trainer (R3/R4 state) | **~19.9** | marginal over 20 steps incl. CLI overhead; scalar tape, per-step graph allocation, no SIMD/fusion |
+
+Notes:
+- This is the R5 (K1/K2) starting point, not a gate result. The ne2410
+  throughput bar (≥ 2× the PyTorch baseline at equal tokens/step) is claimed
+  only in R5 with the fused compiled step, zero-alloc path, and
+  tied-logit-free CE in place.
+- The PyTorch baseline supersedes the earlier proxy figure (26.6 tok/s decode,
+  above) for training-step comparisons; that proxy measured greedy decode
+  without KV cache, a different workload.
