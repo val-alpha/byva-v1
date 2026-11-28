@@ -53,10 +53,21 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 [[package]]
 name = "byva-cli"
 version = "0.1.0"
+dependencies = [
+ "byva-convert",
+ "byva-runtime",
+ "byva-tokenizer",
+ "serde_json",
+]
 
 [[package]]
 name = "byva-convert"
 version = "0.1.0"
+dependencies = [
+ "byva-model",
+ "byva-runtime",
+ "thiserror",
+]
 
 [[package]]
 name = "byva-format"
@@ -83,6 +94,13 @@ dependencies = [
 [[package]]
 name = "byva-runtime"
 version = "0.1.0"
+dependencies = [
+ "byva-model",
+ "criterion",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "byva-tokenizer"
