@@ -8,7 +8,9 @@ repository.workspace = true
 
 [dependencies]
 byva-tokenizer = { path = "../tokenizer" }
+byva-data = { path = "../data" }
 byva-runtime = { path = "../runtime" }
+byva-trainer = { path = "../trainer" }
 byva-convert = { path = "../convert" }
 serde_json.workspace = true
 

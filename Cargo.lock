@@ -64,8 +64,10 @@ name = "byva-cli"
 version = "0.1.0"
 dependencies = [
  "byva-convert",
+ "byva-data",
  "byva-runtime",
  "byva-tokenizer",
+ "byva-trainer",
  "serde_json",
 ]
 
@@ -143,6 +145,10 @@ dependencies = [
 name = "byva-trainer"
 version = "0.1.0"
 dependencies = [
+ "byva-autodiff",
+ "byva-data",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

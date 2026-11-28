@@ -16,4 +16,6 @@ mod optim;
 
 pub use error::AutodiffError;
 pub use graph::{Graph, NodeId};
-pub use optim::{AdamW, AdamWConfig, OptimError, SignTrust, SignTrustConfig};
+pub use optim::{
+    AdamW, AdamWConfig, AdamWState, OptimError, SignTrust, SignTrustConfig, SignTrustState,
+};

@@ -107,6 +107,51 @@ impl AdamW {
     pub fn steps(&self) -> u64 {
         self.step
     }
+
+    /// Overrides the learning rate (used by the trainer's LR schedule).
+    pub fn set_learning_rate(&mut self, lr: f32) -> Result<(), OptimError> {
+        if lr <= 0.0 {
+            return Err(OptimError::InvalidConfig {
+                reason: format!("lr must be positive, found {lr}"),
+            });
+        }
+        self.config.lr = lr;
+        Ok(())
+    }
+
+    /// Immutable snapshot of the optimizer state for checkpointing.
+    pub fn state(&self) -> AdamWState {
+        AdamWState {
+            m: self.m.clone(),
+            v: self.v.clone(),
+            step: self.step,
+        }
+    }
+
+    /// Restores a snapshot; lengths must match the current state.
+    pub fn restore(&mut self, state: AdamWState) -> Result<(), OptimError> {
+        if state.m.len() != self.m.len() || state.v.len() != self.v.len() {
+            return Err(OptimError::LengthMismatch {
+                expected: self.m.len(),
+                found: state.m.len(),
+            });
+        }
+        self.m = state.m;
+        self.v = state.v;
+        self.step = state.step;
+        Ok(())
+    }
+}
+
+/// Serializable snapshot of `AdamW` state (moments and step count).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdamWState {
+    /// First-moment buffer.
+    pub m: Vec<f32>,
+    /// Second-moment buffer.
+    pub v: Vec<f32>,
+    /// Number of update steps taken.
+    pub step: u64,
 }
 
 fn validate_adamw(config: &AdamWConfig) -> Result<(), OptimError> {
@@ -238,6 +283,55 @@ impl SignTrust {
     pub fn steps(&self) -> u64 {
         self.steps
     }
+
+    /// Overrides the learning rate (used by the trainer's LR schedule).
+    pub fn set_learning_rate(&mut self, lr: f32) -> Result<(), OptimError> {
+        if lr <= 0.0 {
+            return Err(OptimError::InvalidConfig {
+                reason: format!("lr must be positive, found {lr}"),
+            });
+        }
+        self.config.lr = lr;
+        Ok(())
+    }
+
+    /// Immutable snapshot of the optimizer state for checkpointing.
+    pub fn state(&self) -> SignTrustState {
+        SignTrustState {
+            momenta: self.momenta.clone(),
+            steps: self.steps,
+        }
+    }
+
+    /// Restores a snapshot; the layer layout must match the current state.
+    pub fn restore(&mut self, state: SignTrustState) -> Result<(), OptimError> {
+        if state.momenta.len() != self.momenta.len() {
+            return Err(OptimError::UnknownLayer {
+                layers: self.momenta.len(),
+                layer: state.momenta.len(),
+            });
+        }
+        for (momentum, restored) in self.momenta.iter_mut().zip(&state.momenta) {
+            if momentum.len() != restored.len() {
+                return Err(OptimError::LengthMismatch {
+                    expected: momentum.len(),
+                    found: restored.len(),
+                });
+            }
+        }
+        self.momenta = state.momenta;
+        self.steps = state.steps;
+        Ok(())
+    }
+}
+
+/// Serializable snapshot of `SignTrust` state (per-layer momenta).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignTrustState {
+    /// One momentum buffer per layer.
+    pub momenta: Vec<Vec<f32>>,
+    /// Number of layer updates taken.
+    pub steps: u64,
 }
 
 fn validate_signtrust(config: &SignTrustConfig) -> Result<(), OptimError> {
@@ -411,6 +505,80 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         let expected = 0.0001f32 - 0.01 * 0.25;
         assert!((params[0] - expected).abs() < 1e-9, "got {}", params[0]);
+    }
+
+    #[test]
+    fn adamw_state_round_trip_preserves_update_trajectory() {
+        let config = AdamWConfig {
+            lr: 0.1,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.1,
+        };
+        let mut a = AdamW::new(config.clone(), 3).unwrap_or_else(|e| panic!("{e}"));
+        let mut b = AdamW::new(config.clone(), 3).unwrap_or_else(|e| panic!("{e}"));
+        let mut params_a = [1.0f32, -2.0, 0.5];
+        let mut params_b = params_a;
+        a.step(&mut params_a, &[0.3, -0.1, 0.9])
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        b.step(&mut params_b, &[0.3, -0.1, 0.9])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let restored = b.state();
+        let mut c = AdamW::new(
+            AdamWConfig {
+                lr: 0.5,
+                ..config.clone()
+            },
+            3,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        c.restore(restored).unwrap_or_else(|e| panic!("{e}"));
+        c.set_learning_rate(0.1).unwrap_or_else(|e| panic!("{e}"));
+
+        let tail = [-0.2f32, 0.4, 0.1];
+        a.step(&mut params_a, &tail)
+            .unwrap_or_else(|e| panic!("{e}"));
+        c.step(&mut params_b, &tail)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(params_a, params_b);
+        assert_eq!(a.state(), c.state());
+    }
+
+    #[test]
+    fn signtrust_state_round_trip_preserves_update_trajectory() {
+        let config = SignTrustConfig {
+            lr: 0.01,
+            beta1: 0.9,
+            weight_decay: 0.0,
+            clamp_min: 0.25,
+            clamp_max: 4.0,
+        };
+        let mut a = SignTrust::new(config.clone(), &[2, 1]).unwrap_or_else(|e| panic!("{e}"));
+        let mut params_a = [1.0f32, -2.0];
+        a.step_layer(0, &mut params_a, &[0.5, -0.5])
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let restored = a.state();
+        let mut b = SignTrust::new(
+            SignTrustConfig {
+                lr: 0.9,
+                ..config.clone()
+            },
+            &[2, 1],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        b.restore(restored).unwrap_or_else(|e| panic!("{e}"));
+        b.set_learning_rate(0.01).unwrap_or_else(|e| panic!("{e}"));
+
+        let mut params_b = params_a;
+        a.step_layer(0, &mut params_a, &[-0.2, 0.1])
+            .unwrap_or_else(|e| panic!("{e}"));
+        b.step_layer(0, &mut params_b, &[-0.2, 0.1])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(params_a, params_b);
+        assert_eq!(a.state(), b.state());
     }
 
     #[test]
