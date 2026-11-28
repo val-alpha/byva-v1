@@ -46,6 +46,71 @@ struct TensorSpec {
 }
 
 impl Weights {
+    /// Builds weights from tensors in canonical order, validating names,
+    /// element counts, finiteness, and config consistency. Used by the
+    /// Phase 4 converter before serializing a `byva-weights-v1` file.
+    ///
+    /// # Errors
+    /// Fails when the config is invalid, a tensor name is unknown or
+    /// misplaced, an element count mismatches, or a value is non-finite.
+    pub fn from_tensors(
+        config: ModelConfig,
+        tensors: Vec<(String, Vec<f32>)>,
+    ) -> Result<Self, RuntimeError> {
+        let specs = canonical_layout(&config)?;
+        if tensors.len() != specs.len() {
+            return Err(RuntimeError::TensorCount {
+                got: tensors.len() as u32,
+                expected: specs.len() as u32,
+            });
+        }
+        for ((name, values), spec) in tensors.iter().zip(&specs) {
+            if *name != spec.name {
+                return Err(RuntimeError::TensorOrder {
+                    found: name.clone(),
+                    expected: spec.name.clone(),
+                });
+            }
+            let elements = values.len() as u64;
+            if elements != spec.elements {
+                return Err(RuntimeError::TensorSize {
+                    name: name.clone(),
+                    got: elements,
+                    expected: spec.elements,
+                });
+            }
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(RuntimeError::NonFiniteTensor { name: name.clone() });
+            }
+        }
+        Ok(Self { config, tensors })
+    }
+
+    /// Serializes to the `byva-weights-v1` file image (little-endian).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&WEIGHTS_MAGIC);
+        out.push(WEIGHTS_FORMAT_VERSION);
+        out.extend_from_slice(&self.config.vocab_size.to_le_bytes());
+        out.extend_from_slice(&self.config.d_model.to_le_bytes());
+        out.extend_from_slice(&self.config.n_layers.to_le_bytes());
+        out.extend_from_slice(&self.config.n_heads.to_le_bytes());
+        out.extend_from_slice(&self.config.ffn_hidden.to_le_bytes());
+        out.extend_from_slice(&self.config.max_seq_len.to_le_bytes());
+        out.push(u8::from(self.config.tie_embeddings));
+        out.extend_from_slice(&(self.tensors.len() as u32).to_le_bytes());
+        for (name, values) in &self.tensors {
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        out
+    }
+
     /// Reads, parses, and validates a weights file from disk.
     pub fn from_path(path: &Path) -> Result<Self, RuntimeError> {
         let bytes = std::fs::read(path).map_err(|source| RuntimeError::WeightsIo {
@@ -177,6 +242,20 @@ impl Weights {
     pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
         self.tensors.iter().map(|(name, _)| name.as_str())
     }
+}
+
+/// Canonical tensor names and element counts implied by `config` (D-0013),
+/// in `byva-weights-v1` file order. Shared with the Phase 4 converter.
+///
+/// # Errors
+/// Fails when the config is invalid or the implied layout overflows.
+pub fn canonical_tensor_layout(config: &ModelConfig) -> Result<Vec<(String, u64)>, RuntimeError> {
+    canonical_layout(config).map(|specs| {
+        specs
+            .into_iter()
+            .map(|spec| (spec.name, spec.elements))
+            .collect()
+    })
 }
 
 /// Canonical tensor order and element counts implied by `config` (D-0013).
@@ -476,5 +555,58 @@ mod tests {
             Weights::from_bytes(&bytes),
             Err(RuntimeError::NonFiniteTensor { .. })
         ));
+    }
+
+    #[test]
+    fn from_tensors_round_trips_through_to_bytes() {
+        let config = sample_config();
+        let tensors = sample_tensors(&config);
+        let weights = Weights::from_tensors(config, tensors.clone())
+            .unwrap_or_else(|error| panic!("valid tensors rejected: {error}"));
+        assert_eq!(weights.config(), config);
+        let file = weights.to_bytes();
+        let encoded = encode_file(&config, &tensors);
+        assert_eq!(file, encoded);
+        let reloaded =
+            Weights::from_bytes(&file).unwrap_or_else(|error| panic!("reload rejected: {error}"));
+        assert_eq!(reloaded.config(), config);
+        for (name, values) in &tensors {
+            assert_eq!(reloaded.tensor(name), Some(values.as_slice()));
+        }
+    }
+
+    #[test]
+    fn from_tensors_rejects_out_of_order() {
+        let config = sample_config();
+        let mut tensors = sample_tensors(&config);
+        tensors.swap(0, 1);
+        assert!(matches!(
+            Weights::from_tensors(config, tensors),
+            Err(RuntimeError::TensorOrder { .. })
+        ));
+    }
+
+    #[test]
+    fn from_tensors_rejects_wrong_count() {
+        let config = sample_config();
+        let mut tensors = sample_tensors(&config);
+        tensors.pop();
+        assert!(matches!(
+            Weights::from_tensors(config, tensors),
+            Err(RuntimeError::TensorCount { .. })
+        ));
+    }
+
+    #[test]
+    fn canonical_tensor_layout_matches_sample_tensors() {
+        let config = sample_config();
+        let layout = canonical_tensor_layout(&config)
+            .unwrap_or_else(|error| panic!("layout rejected: {error}"));
+        let sample = sample_tensors(&config);
+        assert_eq!(layout.len(), sample.len());
+        for ((name, elements), (sample_name, values)) in layout.iter().zip(&sample) {
+            assert_eq!(name, sample_name);
+            assert_eq!(*elements, values.len() as u64);
+        }
     }
 }
