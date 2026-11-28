@@ -185,3 +185,50 @@ recorded here instead.
 - The 32,768 BPE table itself is NOT yet trained: no Phase 2 full-corpus
   shards exist in this environment, and the exact trainer is memory-bounded;
   train it in Colab per the notebook (or a future scaled trainer, D-0017).
+
+## Addendum (2026-11-28): local CPU training run — Colab deferred by user decision
+
+The Colab T4 route was deferred by user decision after repeated mid-run
+interruptions of the shard-build cell (three runs recorded in PR #1
+comments). A real training run was executed locally instead, on the same
+trainer code path the notebook uses.
+
+### Environment
+
+- Sandbox CPU: 5 cores, 5 GB RAM, PyTorch 2.15.0+cpu (fp32, 5 threads).
+- Nothing corpus- or checkpoint-related enters Git (D-0007).
+
+### Corpus (same five verified sources as the notebook, 60:40 id:en)
+
+- wikipedia 20231101.id 2,400 / c4 id 2,400 / fineweb-2 ind_Latn 1,200 /
+  wikipedia 20231101.en 2,400 / fineweb-edu sample-10BT 1,600 = 10,000 docs,
+  ~99 MB via the HF datasets-server.
+- `build_shards.py`: 9,962 docs kept, 10 shards, manifest verified.
+
+### Tokenizer (exact trainer, D-0017/D-0018 semantics)
+
+- Trained on a 2.77 MB subsample (519 docs, ~0.6 MB per source): the exact
+  trainer's documented memory bound (occurrence-index scaling) was confirmed
+  empirically — 20 MB OOM-killed at ~3.8 GB RSS, 2.77 MB peaked at ~1.2 GB.
+- Result: 32,465 merges (vocab 32,768) in 162 s; trainer stats: 5.53
+  bytes/token on its own corpus.
+- Caveat: subsample-trained table; compression is weaker than a
+  full-corpus table would be. A memory-bounded scaled trainer remains the
+  open item for production.
+
+### Model training (TINY, D-0013: 11,670,016 params, verified from checkpoint)
+
+- `train.py --config tiny --tokenizer <artifact> --device cpu --steps 200
+  --seq-len 128 --batch-size 8`: 296 s wall clock (~1.1 s/step after a
+  ~200 s corpus encode).
+- Loss: train 10.4658 → 9.2745; val 9.1688 → 8.9338, monotone decreasing.
+- Resume verified per D-0014: `--resume` +10 steps continued 200 → 210 with
+  val loss 8.9338 → 8.8407; checkpoint v2 (140 MB) reloads config, model,
+  optimizer, scaler, and loss history.
+
+### Gate status after this run
+
+- "Real training run with the 32,768-vocab BPE tokenizer": DONE at smoke
+  scale on CPU (TINY). The Phase 3 T4/SMALL gate item is superseded by user
+  decision to defer Colab, not passed; revisit when GPU access returns.
+- Still open: full-corpus shards, production-scale BPE training, SMALL run.
