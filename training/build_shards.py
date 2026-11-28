@@ -27,6 +27,9 @@ from byva_data import (
 )
 
 
+PROGRESS_EVERY = 50_000
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", action="append", required=True, type=Path)
@@ -48,9 +51,21 @@ def main() -> int:
 
     raw_texts: list[str] = []
     for source in args.input:
-        raw_texts.extend(load_documents(source))
+        print(f"loading {source.name} ...", file=sys.stderr, flush=True)
+        loaded_before = len(raw_texts)
+        raw_texts.extend(load_documents(source, progress_every=PROGRESS_EVERY))
+        print(
+            f"loaded {len(raw_texts) - loaded_before} docs from {source.name}",
+            file=sys.stderr,
+            flush=True,
+        )
 
-    docs, stats = prepare_documents(raw_texts, config)
+    print(
+        f"normalizing, filtering, deduplicating {len(raw_texts)} docs ...",
+        file=sys.stderr,
+        flush=True,
+    )
+    docs, stats = prepare_documents(raw_texts, config, progress_every=PROGRESS_EVERY)
     shards = shard_documents(docs, config)
 
     output_dir = args.output_dir
@@ -61,6 +76,12 @@ def main() -> int:
         payload = shard_bytes(shard)
         (output_dir / name).write_bytes(payload)
         written.append((name, payload))
+        if (index + 1) % 100 == 0:
+            print(
+                f"  writing shards: {index + 1}/{len(shards)}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     manifest = build_manifest(args.input, written, config)
     manifest["stats"] = stats
