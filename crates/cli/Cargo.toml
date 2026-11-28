@@ -6,5 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[dependencies]
+byva-tokenizer = { path = "../tokenizer" }
+byva-runtime = { path = "../runtime" }
+serde_json.workspace = true
+
 [lints]
 workspace = true

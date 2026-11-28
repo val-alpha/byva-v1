@@ -6,5 +6,18 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[dependencies]
+byva-model = { path = "../model" }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "decode_bench"
+harness = false

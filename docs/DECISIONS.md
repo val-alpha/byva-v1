@@ -165,3 +165,33 @@ Add dated entries for material decisions. Record superseded decisions rather tha
 - Decision: The canonical exact trainer (D-0017/D-0020) gains a memory-bounded Rust implementation, `byva_tokenizer::trainer::train_bpe` (CLI `cargo run --release -p byva-tokenizer --bin train_bpe`), used for all training corpora beyond a few tens of MB where the pure-Python trainer exhausts RAM. It is contractually identical to the Python trainer: aggregated pair counts over the document set, (count desc, left asc, right asc) selection, occurrences replaced in ascending (document, index) order without overlap, and pairs below two occurrences are not mergeable. Documents are `u32` symbol arrays; pair positions are packed (document, index) `u64` entries in per-pair sets, with a stale-tolerant candidate heap that is compacted when it exceeds four times the live pair count plus a fixed slack. Cross-language equivalence is pinned by the golden fixture (byte-identical artifact) and was verified byte-identical against the Python trainer on a 2.77 MB shard sample at the full 32,768 vocabulary; the Python trainer remains the readable reference definition of the contract.
 - Rationale: the Python exact trainer peaked near the sandbox RAM ceiling on a 20 MB corpus, so the 99 MB local corpus (and later full shards) cannot train in Python; a second implementation only stays safe if byte-identity is enforced, not assumed.
 - Consequences: any change to either trainer must keep the golden fixture byte-identical and re-verify cross-language equivalence on a multi-hundred-merge corpus; the Rust trainer's input JSONL is NFC-normalized at read time, matching `load_shard_texts`; production artifact retraining (D-0020) uses this trainer.
+
+## D-0023 — Phase 5 runtime: `byva-weights-v1` container, SplitMix64 parity fixture, scalar fp32 backend first
+
+- Status: Accepted
+- Date: 2026-11-28
+- Decision: The Phase 5 runtime consumes a little-endian `byva-weights-v1`
+  container (magic `BYVAW`, versioned header embedding the `ModelConfig`,
+  canonical tensor order matching the PyTorch state dict, per-tensor f32
+  payloads) validated by `byva_runtime::weights::Weights`; the Phase 4
+  converter writes exactly this format. Numerical parity with the PyTorch
+  training reference is pinned without committing a weight blob: both sides
+  synthesize weights from a documented SplitMix64 generator (fixture seed
+  0x2026_1128_5EED_0001, scale 0.02) — `training/make_runtime_fixture.py`
+  runs the reference forward pass and records the exact f32 logits (bit
+  patterns, full 32,768-wide vector at the final prompt position) while
+  `byva_runtime::lcg::fixture_weights` rebuilds the identical weights. The
+  Phase 5 backend is portable scalar fp32 (f64 LayerNorm accumulation,
+  exact-erf GELU); SIMD and int8/int4 quantization stay behind this interface
+  for Phase 7 (D-0019), and no D-0019 budget claim is made from Phase 5
+  numbers.
+- Rationale: a committed synthetic weight blob would duplicate what the two
+  generators define and could drift; the generator pair makes the weight
+  source auditable while the committed logit bits make the numerical contract
+  checkable in CI on any machine.
+- Consequences: Phase 4 conversion must emit `byva-weights-v1` in the
+  canonical tensor order; any D-0013 architecture change must regenerate the
+  fixture through the generator pair in the same commit; the fixture holds
+  reference logits only — no corpora or checkpoints (D-0007). Decode uses a
+  preallocated KV cache with no per-token allocation; context is bounded by
+  `max_seq_len` learned positions (no sliding window at Phase 5).

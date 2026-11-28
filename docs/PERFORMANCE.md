@@ -95,10 +95,34 @@ Reproduce:
 python3 training/bench_decode.py --checkpoint <ckpt.pt>
 ~~~
 
+## Rust runtime decode, fp32 scalar (Phase 5, D-0023)
+
+Recorded 2026-11-28 on the same environment (Xeon 6985P-C, stable rustc
+1.100.0, criterion 0.7, release build). TINY configuration (11.7M params,
+D-0013) with synthetic SplitMix64 fixture weights (D-0023), scalar fp32
+backend, preallocated KV cache, greedy, single thread. Measured via
+`cargo bench -p byva-runtime --bench decode_bench` (64-token prompt prefill
+excluded from timing, 64 greedy decode tokens per iteration, 100 samples):
+
+| Model | Backend | Median per token | Throughput |
+|---|---|---|---|
+| TINY | scalar fp32 | 5.70 ms | 175 tok/s (174.4–176.4) |
+
+Notes:
+- 6.6x above the PyTorch reference proxy (26.6 tok/s, above), which had no KV
+  cache and re-ran the full forward per token.
+- The D-0019 budget (TINY >= 200 tok/s) is NOT claimed here; the formal claim
+  belongs to the Phase 7 harness. The remaining ~14% gap is expected to close
+  with the int8 default path and SIMD backend (D-0019), which are not built
+  yet at Phase 5.
+- Logits projection (tied embeddings, 32,768 x 256 fp32 = 33.5 MB streamed
+  per token) dominates the scalar decode cost; this bounds the scalar fp32
+  ceiling and motivates the int8 default path.
+
 ## What is deliberately absent
 
-- Rust inference/decoder benchmarks: the runtime crate has no execution engine
-  yet (Phase 5). No D-0019 budget claim is possible or made from the proxy above.
 - GPU benchmarks: no GPU in this environment; will be recorded only after
   capability detection and validation on actual hardware (Phase 5/7).
 - Dataset/shard benchmarks: Phase 2 and later.
+- SIMD and quantized-path numbers: the int8/int4 paths and SIMD backends are
+  Phase 7 work behind the D-0023 backend interface.
