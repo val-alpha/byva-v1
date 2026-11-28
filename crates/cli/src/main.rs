@@ -23,13 +23,14 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("generate") => generate(&args[1..]),
+        Some("convert") => convert(&args[1..]),
         _ => Err(usage().to_string()),
     }
 }
 
 const fn usage() -> &'static str {
     "usage: byva-cli generate --weights <byva-weights-v1 file> --tokenizer <artifact.json> \
---prompt <text> [--max-new <count>]"
+--prompt <text> [--max-new <count>]\n       byva-cli convert --checkpoint <training checkpoint> --out <byva-weights-v1 file>"
 }
 
 fn value_at(args: &[String], flag: &str, index: &mut usize) -> Result<String, String> {
@@ -106,6 +107,67 @@ fn generate(args: &[String]) -> Result<(), String> {
         .decode_content(&generated)
         .map_err(|error| error.to_string())?;
     println!("{text}");
+    Ok(())
+}
+
+fn convert(args: &[String]) -> Result<(), String> {
+    let mut checkpoint_path: Option<PathBuf> = None;
+    let mut out_path: Option<PathBuf> = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--checkpoint" => {
+                checkpoint_path = Some(PathBuf::from(value_at(args, "--checkpoint", &mut index)?));
+            }
+            "--out" => {
+                out_path = Some(PathBuf::from(value_at(args, "--out", &mut index)?));
+            }
+            other => return Err(format!("unknown argument {other:?}; {}", usage())),
+        }
+        index += 1;
+    }
+
+    let checkpoint_path = checkpoint_path.ok_or("missing --checkpoint")?;
+    let out_path = out_path.ok_or("missing --out")?;
+
+    let checkpoint =
+        byva_convert::Checkpoint::from_path(&checkpoint_path).map_err(|error| error.to_string())?;
+    let weights =
+        byva_convert::checkpoint_to_weights(&checkpoint).map_err(|error| error.to_string())?;
+    let bytes = weights.to_bytes();
+    std::fs::write(&out_path, &bytes)
+        .map_err(|error| format!("failed to write {}: {error}", out_path.display()))?;
+
+    let reloaded = Weights::from_path(&out_path).map_err(|error| error.to_string())?;
+    if reloaded.to_bytes() != bytes {
+        return Err("reload verification failed: bytes differ".to_string());
+    }
+
+    let config = reloaded.config();
+    println!(
+        "converted {} (step {}) -> {}",
+        checkpoint.format,
+        checkpoint.step,
+        out_path.display()
+    );
+    println!(
+        "config: vocab_size={} d_model={} n_layers={} n_heads={} ffn_hidden={} max_seq_len={} tie_embeddings={}",
+        config.vocab_size,
+        config.d_model,
+        config.n_layers,
+        config.n_heads,
+        config.ffn_hidden,
+        config.max_seq_len,
+        config.tie_embeddings
+    );
+    println!(
+        "tensors: {} ({} parameters)",
+        reloaded.tensor_names().count(),
+        config
+            .parameter_count()
+            .map_err(|error| error.to_string())?
+    );
     Ok(())
 }
 

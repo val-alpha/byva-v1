@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 byva-tokenizer = { path = "../tokenizer" }
 byva-runtime = { path = "../runtime" }
+byva-convert = { path = "../convert" }
 serde_json.workspace = true
 
 [lints]

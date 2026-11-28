@@ -6,5 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[dependencies]
+byva-model = { path = "../model" }
+byva-runtime = { path = "../runtime" }
+thiserror.workspace = true
+
 [lints]
 workspace = true

@@ -195,3 +195,40 @@ Add dated entries for material decisions. Record superseded decisions rather tha
   reference logits only — no corpora or checkpoints (D-0007). Decode uses a
   preallocated KV cache with no per-token allocation; context is bounded by
   `max_seq_len` learned positions (no sliding window at Phase 5).
+
+## D-0024 — Phase 4 converter: Rust-native zip+pickle subset parser, fp32-only weights, canonical-name validation
+
+- Status: Accepted
+- Date: 2026-11-28
+- Decision: `byva_convert` converts PyTorch training checkpoints
+  (`byva-train-checkpoint-v1`/`-v2`, per D-0014/D-0018) to the
+  `byva-weights-v1` container (D-0023) natively in Rust, with no Python
+  dependency at conversion time. The parser implements exactly the subset
+  `torch.save` emits for this payload, verified by disassembling real
+  archives: stored-method zip entries prefixed with the archive stem (zip64
+  extra/EOCD fields parsed when the 32-bit sentinels are present) and a
+  protocol-2 pickle interpreter for the observed opcode set — including
+  `collections.OrderedDict` reduction, the model OrderedDict's `_metadata`
+  state applied via `BUILD` (merged and ignored), and
+  `torch._utils._rebuild_tensor_v2` tensors whose strided views are gathered
+  into dense little-endian bytes through lazily resolved `data/<key>`
+  storages. The converter accepts only fp32 model storages, requires the
+  model state dict names to match the canonical layout implied by the
+  checkpoint's config exactly (unknown and missing names are typed errors),
+  checks every value is finite, and emits weights through
+  `Weights::from_tensors` before the CLI re-reads the written file to verify
+  the round trip. v1 checkpoints carrying scaler state are rejected
+  (D-0018). Test checkpoints are synthesized in Rust from the same structure
+  (no checkpoint files committed, D-0007); real-torch equivalence is
+  verified locally per run and recorded in `docs/PHASE4_REPORT.md`.
+- Rationale: the conversion path is part of the trusted weight supply chain;
+  relying on Python or permissively-parsed pickle at serve/convert time would
+  widen the attack surface and the toolchain, while a narrow, typed,
+  bounds-checked parser keeps malformed input a rejected input, never a
+  panic.
+- Consequences: any PyTorch serialization change (new opcodes, new storage
+  classes, compression) must extend the parser deliberately with tests; the
+  converter stays read-only over checkpoints and never executes pickled
+  code; weight-layout assumptions (`[out, in]` Linear, fused `[3d, d]` QKV)
+  are shared with the runtime via `canonical_tensor_layout`, so a D-0013
+  architecture change updates both sides in one commit.
