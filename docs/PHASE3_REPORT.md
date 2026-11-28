@@ -121,7 +121,16 @@ Second real-dataset smoke run (same tiny config, byte-level, CPU):
   outside this environment.
 - **OSCAR-2301 sample** — gated dataset (HTTP 401); needs HF authentication.
 
-## Addendum (2026-11-28): BPE vocabulary trained (D-0017)
+## Addendum (2026-11-28): BPE vocabulary trained — SUPERSEDED by D-0020
+
+> **Status after the D-0020 reconciliation:** this addendum records the run of
+> the word-type pre-tokenized trainer variant, which was trained against a
+> regex pre-tokenization while the Rust tokenizer serves through
+> `encode_bytes` (byte-level, no pre-tokenization). The exact byte-level
+> trainer is canonical, this trainer variant has been removed together with
+> its Python tests, and its committed artifact is kept only until the
+> canonical trainer replaces it (see the 2026-11-28 local-run addendum and
+> D-0020). The numbers below stay here as the recorded history of that run.
 
 The 32,768-vocabulary BPE table required by D-0015 now exists.
 
@@ -143,15 +152,14 @@ The 32,768-vocabulary BPE table required by D-0015 now exists.
 - Committed artifacts: `artifacts/tokenizer/byva-tokenizer-v1.json`
   (sha256 `bb380795929e6ff89e3437ce1590928454727759bbec78a4e37f255d27b6cd77`)
   and its training manifest `byva-tokenizer-v1.manifest.json`.
-- Validation actually run on this commit: new Rust integration test
+- Validation actually run on that commit: new Rust integration test
   `crates/tokenizer/tests/bpe_artifact.rs` (5 tests: artifact loads under the
   published vocab bounds, bilingual round trips, compression, all 32,465
-  merges expand to bytes, control IDs stay outside content decoding) and
-  Python suite `training/tests/test_bpe.py` (12 tests including a frozen mini
-  fixture and a committed-artifact guard).
-- Still open: `training/train.py` continues to encode byte ids (D-0015);
-  wiring `--tokenizer` support into the trainer is the next step before the
-  real T4 run, so production pretraining consumes only this artifact.
+  merges expand to bytes, control IDs stay outside content decoding) and the
+  word-trainer Python suite (12 tests, since removed with the superseded
+  trainer per D-0020).
+- Still open: resolved on this branch — `train.py` gained `--tokenizer`
+  (D-0018), so production pretraining consumes a trained artifact.
 
 ## CI
 
