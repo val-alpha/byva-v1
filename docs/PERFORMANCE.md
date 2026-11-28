@@ -152,3 +152,58 @@ Notes:
 - The PyTorch baseline supersedes the earlier proxy figure (26.6 tok/s decode,
   above) for training-step comparisons; that proxy measured greedy decode
   without KV cache, a different workload.
+
+## Trainer step throughput: ne2410 K2 fused kernels (R5, D-0022)
+
+- Date: 2026-11-28
+- Toolchain: Rust release build (rustc 1.100.0), fused f32 kernels in
+  `crates/autodiff/src/graph.rs`; torch 2.15.0+cpu (5 threads, Python
+  3.12.14) for the reference
+- CPU: Intel(R) Xeon(R) 6985P-C @ 2.30GHz, 5 cores visible to the sandbox
+- Config: TINY (11,670,016 params), seq 128, exactly 1024 tokens/step,
+  40 steps (eval steps excluded from step-time samples), AdamW lr 1e-3,
+  weight decay 1e-2 (harness: `training/bench_ne2410.py`)
+
+| Trainer | mean s/step | p50 | p99 | Notes |
+|---|---|---|---|---|
+| PyTorch reference | **0.275** | 0.278 | 0.299 | AVX-512 MKL; 0.28-0.39 across sessions |
+| ne2410 (R3/R4 scalar tape) | ~19.9 | - | - | R4 starting point |
+| ne2410 AdamW (R5, K2) | **2.628** | 2.533 | 3.401 | fused threaded kernels, f32 accumulation |
+| ne2410 SignTrust (R5, K2) | **2.673** | 2.687 | 3.276 | optimizer cost ~80 ms/step |
+
+K2 kernel work (deterministic, thread-count independent):
+
+- f32 accumulation with fixed sequential order per output element; parallelism
+  only over disjoint output rows/elements (fixed partition), so results are
+  bit-identical for any thread count. Parity gate after the rewrite: max abs
+  loss diff 8.900e-07, final-weight diff 5.903e-05 (both improved vs R4's
+  f64-accumulated 1.237e-06 / 8.36e-05).
+- Cross-entropy: per-row stats cached in forward (max/sum/loss), backward
+  split into two parallel passes (hidden grads, then embedding-table grads);
+  tied-logit-free (full `[tokens, vocab]` logits never materialized). The R4
+  backward wrote the 33.5 MB `gtable` once per row (~34 GB of traffic/step).
+- Matmuls: axpy-form over a transposed operand (`batched_nt_rows` now
+  transposes to `[k, n]` and reuses the NN kernel). Kernel micro-benchmark
+  (1024x256x768, release): dot form 10.3 G MAC/s aggregate -> axpy form
+  38.5 G MAC/s (NT) and 42.4 G MAC/s (NN); single-thread `dot_f32` 5.5
+  G MAC/s. Step time 19.9 -> ~4.5 (first fusion round) -> ~2.5 s/step.
+- Allocations: per-step graph leaf-copy + value collection measured at
+  ~25 ms of a ~2.5 s step (~1%); the full K1 tape-replay program/arena
+  (zero-alloc step) is deferred as not the bottleneck.
+
+Gate results (D-0022/K6, honest record):
+
+- **Throughput gate FAIL: 0.10x** vs PyTorch (bar >= 2x). Portable safe Rust
+  (SSE2-baseline auto-vectorization) measures ~42 G MAC/s aggregate vs
+  PyTorch's AVX-512 MKL dispatch. Recorded for D-0022 revision 1: options are
+  explicit SIMD/intrinsics or a GPU backend (candidate R7 work), a revised
+  gate definition, or a D-0008 documented exception.
+- **SignTrust gate FAIL at TINY**: held-out loss at 40 steps, equal wall-clock
+  (AdamW lr 1e-3 wd 1e-2: 4.4478; SignTrust evals worsen monotonically after
+  step 10 on this synthetic corpus): lr 2.5e-4 (0.25x) -> 4.8041, 5e-4 (0.5x)
+  -> 5.8373, 1e-3 (1x) -> 5.4549, 2e-3 (2x) -> 6.5643; weight decay 5x/10x at
+  the two lower lrs -> 5.8226 / 4.7831 (no trend change). Consistent with the
+  small-batch caution (arXiv:2509.01440): batch 8. SignTrust stays a
+  non-default flag; re-evaluation deferred to a larger-batch/corpus setting.
+- p99 step latency recorded above (3.401 s AdamW / 3.276 s SignTrust) next to
+  the means, per the K6 latency discipline row.

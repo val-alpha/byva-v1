@@ -21,6 +21,6 @@ pub use checkpoint::{
 };
 pub use config::{ModelConfig, OptimizerKind, TrainConfig};
 pub use error::TrainerError;
-pub use model::{ParamLayout, ParamSpec, build_layout, forward, init_params};
+pub use model::{ParamLayout, ParamSpec, build_layout, explain_step, forward, init_params};
 pub use rng::SplitMix64;
 pub use training::Trainer;

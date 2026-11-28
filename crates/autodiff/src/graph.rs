@@ -4,8 +4,9 @@
 //! transformer, causal MHA, exact-erf GELU, tied output head). The
 //! cross-entropy op is tied-logit-free (K2): logits are computed row by row
 //! against the embedding table and the full `[n, vocab]` logits matrix is
-//! never materialized. All reduction orders are fixed and single-threaded,
-//! so a given graph evaluates deterministically.
+//! never materialized. All reduction orders are fixed, and work that is
+//! independent per output element is split across a fixed partition of the
+//! output, so a given graph evaluates bit-identically for any thread count.
 
 use byva_tensor::Tensor;
 
@@ -32,18 +33,42 @@ enum Op {
     Mul,
     Sum,
     AddBroadcastRows,
-    MulScalar { c: f32 },
+    MulScalar {
+        c: f32,
+    },
     Reshape,
-    Embed { ids: Vec<u32> },
-    SliceCols { start: usize, ncols: usize },
+    Embed {
+        ids: Vec<u32>,
+    },
+    SliceCols {
+        start: usize,
+        ncols: usize,
+    },
     HeadsToRows,
-    RowsToHeads { heads: usize },
+    RowsToHeads {
+        heads: usize,
+    },
     BatchedMatMulNT,
     BatchedMatMulNN,
     CausalSoftMax,
-    LayerNorm { eps: f32 },
+    LayerNorm {
+        eps: f32,
+    },
     Gelu,
-    CrossEntropyTied { targets: Vec<u32> },
+    CrossEntropyTied {
+        targets: Vec<u32>,
+        stats: Vec<CeRowStat>,
+    },
+}
+
+/// Per-row softmax statistics cached by the forward cross-entropy pass so
+/// the backward pass can rebuild probabilities without a separate sweep
+/// over the vocabulary.
+#[derive(Debug, Clone)]
+struct CeRowStat {
+    max: f32,
+    sum: f64,
+    loss: f64,
 }
 
 struct Node {
@@ -107,18 +132,10 @@ impl Graph {
         }
         let (m, k) = (a_shape[0], a_shape[1]);
         let n = b_shape[1];
-        let a_data = self.data(a)?;
-        let b_data = self.data(b)?;
+        let a_data = self.data_ref(a)?;
+        let b_data = self.data_ref(b)?;
         let mut out = vec![0.0f32; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0f64;
-                for l in 0..k {
-                    acc += f64::from(a_data[i * k + l]) * f64::from(b_data[l * n + j]);
-                }
-                out[i * n + j] = acc as f32;
-            }
-        }
+        batched_nn_rows(&mut out, a_data, b_data, 1, m, k, n);
         self.push_output(Op::MatMul, vec![a, b], &[m, n], out)
     }
 
@@ -375,21 +392,10 @@ impl Graph {
         }
         let (batches, m, k) = (a_shape[0], a_shape[1], a_shape[2]);
         let n = b_shape[1];
-        let a_data = self.data(a)?;
-        let b_data = self.data(b)?;
+        let a_data = self.data_ref(a)?;
+        let b_data = self.data_ref(b)?;
         let mut out = vec![0.0f32; batches * m * n];
-        for o in 0..batches {
-            for i in 0..m {
-                for j in 0..n {
-                    let mut acc = 0.0f64;
-                    for l in 0..k {
-                        acc += f64::from(a_data[(o * m + i) * k + l])
-                            * f64::from(b_data[(o * n + j) * k + l]);
-                    }
-                    out[(o * m + i) * n + j] = acc as f32;
-                }
-            }
-        }
+        batched_nt_rows(&mut out, a_data, b_data, batches, m, n, k);
         let out_shape = vec![batches, m, n];
         self.push_output(Op::BatchedMatMulNT, vec![a, b], &out_shape, out)
     }
@@ -414,21 +420,10 @@ impl Graph {
         }
         let (batches, m, k) = (a_shape[0], a_shape[1], a_shape[2]);
         let n = b_shape[2];
-        let a_data = self.data(a)?;
-        let b_data = self.data(b)?;
+        let a_data = self.data_ref(a)?;
+        let b_data = self.data_ref(b)?;
         let mut out = vec![0.0f32; batches * m * n];
-        for o in 0..batches {
-            for i in 0..m {
-                for j in 0..n {
-                    let mut acc = 0.0f64;
-                    for l in 0..k {
-                        acc += f64::from(a_data[(o * m + i) * k + l])
-                            * f64::from(b_data[(o * k + l) * n + j]);
-                    }
-                    out[(o * m + i) * n + j] = acc as f32;
-                }
-            }
-        }
+        batched_nn_rows(&mut out, a_data, b_data, batches, m, k, n);
         let out_shape = vec![batches, m, n];
         self.push_output(Op::BatchedMatMulNN, vec![a, b], &out_shape, out)
     }
@@ -544,7 +539,12 @@ impl Graph {
     /// Exact-erf GELU matching `torch.nn.GELU()` (elementwise).
     pub fn gelu(&mut self, x: NodeId) -> Result<NodeId, AutodiffError> {
         let shape = self.shape(x)?;
-        let out: Vec<f32> = self.data(x)?.iter().map(|&v| gelu(v)).collect();
+        let mut out = self.data(x)?;
+        for_each_chunk_mut(&mut out, 8192, |_start, chunk| {
+            for slot in chunk.iter_mut() {
+                *slot = gelu(*slot);
+            }
+        });
         self.push_output(Op::Gelu, vec![x], &shape, out)
     }
 
@@ -597,33 +597,54 @@ impl Graph {
                 });
             }
         }
-        let hidden_data = self.data(hidden)?;
-        let table_data = self.data(table)?;
-        let mut logits_row = vec![0.0f32; vocab];
-        let mut total = 0.0f64;
-        for i in 0..n {
-            let row = &hidden_data[i * d..(i + 1) * d];
-            let mut max = f32::NEG_INFINITY;
-            for j in 0..vocab {
-                let l = dot_f64(row, &table_data[j * d..(j + 1) * d]) as f32;
-                logits_row[j] = l;
-                if l > max {
-                    max = l;
+        let hidden_data = self.data_ref(hidden)?;
+        let table_data = self.data_ref(table)?;
+        let mut table_t = vec![0.0f32; vocab * d];
+        transpose_dt(&mut table_t, table_data, vocab, d);
+        let mut rows = vec![
+            CeRowStat {
+                max: 0.0,
+                sum: 0.0,
+                loss: 0.0,
+            };
+            n
+        ];
+        for_each_chunk_mut(&mut rows, 1, |start, chunk| {
+            let mut logits_row = vec![0.0f32; vocab];
+            for (offset, row) in chunk.iter_mut().enumerate() {
+                let i = start + offset;
+                let hidden_row = &hidden_data[i * d..(i + 1) * d];
+                logits_row.fill(0.0);
+                for (l, &h) in hidden_row.iter().enumerate() {
+                    let t_row = &table_t[l * vocab..(l + 1) * vocab];
+                    for (slot, &t) in logits_row.iter_mut().zip(t_row) {
+                        *slot += h * t;
+                    }
                 }
+                let mut max = f32::NEG_INFINITY;
+                for &l in logits_row.iter() {
+                    if l > max {
+                        max = l;
+                    }
+                }
+                let target_logit = logits_row[targets[i] as usize];
+                let mut sum = 0.0f64;
+                for slot in logits_row.iter_mut() {
+                    let e = f32::exp(*slot - max);
+                    *slot = e;
+                    sum += f64::from(e);
+                }
+                row.max = max;
+                row.sum = sum;
+                row.loss = f64::from(max) + sum.ln() - f64::from(target_logit);
             }
-            let target_logit = logits_row[targets[i] as usize];
-            let mut sum = 0.0f64;
-            for slot in logits_row.iter_mut() {
-                let e = f32::exp(*slot - max);
-                *slot = e;
-                sum += f64::from(e);
-            }
-            total += f64::from(max) + sum.ln() - f64::from(target_logit);
-        }
+        });
+        let total: f64 = rows.iter().map(|row| row.loss).sum();
         let loss = (total / n as f64) as f32;
         self.push_output(
             Op::CrossEntropyTied {
                 targets: targets.to_vec(),
+                stats: rows,
             },
             vec![hidden, table],
             &[],
@@ -671,22 +692,14 @@ impl Graph {
         match op {
             Op::Leaf => {}
             Op::MatMul => {
-                let a = self.data(inputs[0])?;
-                let b = self.data(inputs[1])?;
+                let a = self.data_ref(inputs[0])?;
+                let b = self.data_ref(inputs[1])?;
                 let a_shape = self.shape(inputs[0])?;
                 let n = self.shape(inputs[1])?[1];
                 let (m, k) = (a_shape[0], a_shape[1]);
                 let mut ga = vec![0.0f32; m * k];
                 let mut gb = vec![0.0f32; k * n];
-                for i in 0..m {
-                    for j in 0..n {
-                        let g = gy[i * n + j];
-                        for l in 0..k {
-                            ga[i * k + l] += g * b[l * n + j];
-                            gb[l * n + j] += g * a[i * k + l];
-                        }
-                    }
-                }
+                batched_nn_backward_rows(&mut ga, &mut gb, &gy, a, b, m, k, n);
                 self.acc(inputs[0], &ga)?;
                 self.acc(inputs[1], &gb)?;
             }
@@ -783,48 +796,28 @@ impl Graph {
                 self.acc(inputs[0], &gx)?;
             }
             Op::BatchedMatMulNT => {
-                let a = self.data(inputs[0])?;
-                let b = self.data(inputs[1])?;
+                let a = self.data_ref(inputs[0])?;
+                let b = self.data_ref(inputs[1])?;
                 let a_shape = self.shape(inputs[0])?;
                 let b_shape = self.shape(inputs[1])?;
                 let (batches, m, k) = (a_shape[0], a_shape[1], a_shape[2]);
                 let n = b_shape[1];
                 let mut ga = vec![0.0f32; batches * m * k];
                 let mut gb = vec![0.0f32; batches * n * k];
-                for o in 0..batches {
-                    for i in 0..m {
-                        for j in 0..n {
-                            let g = gy[(o * m + i) * n + j];
-                            for l in 0..k {
-                                ga[(o * m + i) * k + l] += g * b[(o * n + j) * k + l];
-                                gb[(o * n + j) * k + l] += g * a[(o * m + i) * k + l];
-                            }
-                        }
-                    }
-                }
+                batched_nt_backward_rows(&mut ga, &mut gb, &gy, a, b, m, n, k);
                 self.acc(inputs[0], &ga)?;
                 self.acc(inputs[1], &gb)?;
             }
             Op::BatchedMatMulNN => {
-                let a = self.data(inputs[0])?;
-                let b = self.data(inputs[1])?;
+                let a = self.data_ref(inputs[0])?;
+                let b = self.data_ref(inputs[1])?;
                 let a_shape = self.shape(inputs[0])?;
                 let b_shape = self.shape(inputs[1])?;
                 let (batches, m, k) = (a_shape[0], a_shape[1], a_shape[2]);
                 let n = b_shape[2];
                 let mut ga = vec![0.0f32; batches * m * k];
                 let mut gb = vec![0.0f32; batches * k * n];
-                for o in 0..batches {
-                    for i in 0..m {
-                        for j in 0..n {
-                            let g = gy[(o * m + i) * n + j];
-                            for l in 0..k {
-                                ga[(o * m + i) * k + l] += g * b[(o * k + l) * n + j];
-                                gb[(o * k + l) * n + j] += g * a[(o * m + i) * k + l];
-                            }
-                        }
-                    }
-                }
+                batched_nn_backward_rows(&mut ga, &mut gb, &gy, a, b, m, k, n);
                 self.acc(inputs[0], &ga)?;
                 self.acc(inputs[1], &gb)?;
             }
@@ -900,68 +893,81 @@ impl Graph {
                 self.acc(inputs[2], &dbias)?;
             }
             Op::Gelu => {
-                let x = self.data(inputs[0])?;
-                let gx: Vec<f32> = x
-                    .iter()
-                    .zip(gy)
-                    .map(|(&v, g)| g * gelu_derivative(v))
-                    .collect();
+                let x = self.data_ref(inputs[0])?;
+                let mut gx = vec![0.0f32; x.len()];
+                for_each_chunk_mut(&mut gx, 8192, |start, chunk| {
+                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                        *slot = gy[start + offset] * gelu_derivative(x[start + offset]);
+                    }
+                });
                 self.acc(inputs[0], &gx)?;
             }
-            Op::CrossEntropyTied { targets } => {
-                let hidden = self.data(inputs[0])?;
-                let table = self.data(inputs[1])?;
+            Op::CrossEntropyTied { targets, stats } => {
+                let hidden = self.data_ref(inputs[0])?;
+                let table = self.data_ref(inputs[1])?;
                 let hidden_shape = self.shape(inputs[0])?;
                 let table_shape = self.shape(inputs[1])?;
                 let (n, d) = (hidden_shape[0], hidden_shape[1]);
                 let vocab = table_shape[0];
                 let scale = f64::from(gy[0]) / n as f64;
+                let mut table_t = vec![0.0f32; vocab * d];
+                transpose_dt(&mut table_t, table, vocab, d);
                 let mut ghidden = vec![0.0f32; n * d];
+                for_each_chunk_mut(&mut ghidden, d, |start, chunk| {
+                    let mut logits_row = vec![0.0f32; vocab];
+                    let mut weighted = vec![0.0f32; d];
+                    for (offset, row) in chunk.chunks_mut(d).enumerate() {
+                        let i = start / d + offset;
+                        let hidden_row = &hidden[i * d..(i + 1) * d];
+                        logits_row.fill(0.0);
+                        for (l, &h) in hidden_row.iter().enumerate() {
+                            let t_row = &table_t[l * vocab..(l + 1) * vocab];
+                            for (slot, &t) in logits_row.iter_mut().zip(t_row) {
+                                *slot += h * t;
+                            }
+                        }
+                        let max = stats[i].max;
+                        let inverse = (1.0 / stats[i].sum) as f32;
+                        for slot in weighted.iter_mut() {
+                            *slot = 0.0;
+                        }
+                        let target = targets[i] as usize;
+                        for (j, &l) in logits_row.iter().enumerate() {
+                            let p = f32::exp(l - max) * inverse;
+                            let t_row = &table[j * d..(j + 1) * d];
+                            for (w_slot, &t) in weighted.iter_mut().zip(t_row) {
+                                *w_slot += p * t;
+                            }
+                        }
+                        let target_row = &table[target * d..(target + 1) * d];
+                        for (slot, (w, t)) in row.iter_mut().zip(weighted.iter().zip(target_row)) {
+                            *slot = (scale * f64::from(w - t)) as f32;
+                        }
+                    }
+                });
                 let mut gtable = vec![0.0f32; vocab * d];
-                let mut probs_row = vec![0.0f32; vocab];
-                let mut weighted = vec![0.0f64; d];
-                for i in 0..n {
-                    let row = &hidden[i * d..(i + 1) * d];
-                    let mut max = f32::NEG_INFINITY;
-                    for j in 0..vocab {
-                        let l = dot_f64(row, &table[j * d..(j + 1) * d]) as f32;
-                        probs_row[j] = l;
-                        if l > max {
-                            max = l;
-                        }
-                    }
-                    let mut sum = 0.0f64;
-                    for slot in probs_row.iter_mut() {
-                        let e = f32::exp(*slot - max);
-                        *slot = e;
-                        sum += f64::from(e);
-                    }
-                    let inverse = (1.0 / sum) as f32;
-                    for slot in probs_row.iter_mut() {
-                        *slot *= inverse;
-                    }
-                    let target = targets[i] as usize;
-                    for slot in weighted.iter_mut() {
-                        *slot = 0.0;
-                    }
-                    for (j, &p) in probs_row.iter().enumerate() {
-                        let delta = if j == target { scale } else { 0.0 };
+                for_each_chunk_mut(&mut gtable, 8 * d, |start, chunk| {
+                    let first_row = start / d;
+                    let row_count = chunk.len() / d;
+                    for r in 0..row_count {
+                        let j = first_row + r;
                         let t_row = &table[j * d..(j + 1) * d];
-                        for (weighted_slot, &t) in weighted.iter_mut().zip(t_row) {
-                            *weighted_slot += f64::from(p) * f64::from(t);
+                        let g_row = &mut chunk[r * d..(r + 1) * d];
+                        for g_slot in g_row.iter_mut() {
+                            *g_slot = 0.0;
                         }
-                        let coefficient = scale * f64::from(p) - delta;
-                        let g_row = &mut gtable[j * d..(j + 1) * d];
-                        for (g_slot, &h) in g_row.iter_mut().zip(row) {
-                            *g_slot += (coefficient * f64::from(h)) as f32;
+                        for i in 0..n {
+                            let hidden_row = &hidden[i * d..(i + 1) * d];
+                            let l = dot_f32(hidden_row, t_row);
+                            let p = f32::exp(l - stats[i].max) * ((1.0 / stats[i].sum) as f32);
+                            let delta = if j == targets[i] as usize { scale } else { 0.0 };
+                            let coefficient = (scale * f64::from(p) - delta) as f32;
+                            for (g_slot, &h) in g_row.iter_mut().zip(hidden_row) {
+                                *g_slot += coefficient * h;
+                            }
                         }
                     }
-                    for (offset, g_slot) in ghidden[i * d..(i + 1) * d].iter_mut().enumerate() {
-                        *g_slot = (scale
-                            * (weighted[offset] - f64::from(table[target * d + offset])))
-                            as f32;
-                    }
-                }
+                });
                 self.acc(inputs[0], &ghidden)?;
                 self.acc(inputs[1], &gtable)?;
             }
@@ -1001,6 +1007,10 @@ impl Graph {
         Ok(self.node(id.index())?.value.data().to_vec())
     }
 
+    fn data_ref(&self, id: NodeId) -> Result<&[f32], AutodiffError> {
+        Ok(self.node(id.index())?.value.data())
+    }
+
     fn shape(&self, id: NodeId) -> Result<Vec<usize>, AutodiffError> {
         Ok(self.node(id.index())?.value.shape().to_vec())
     }
@@ -1029,11 +1039,274 @@ impl Graph {
     }
 }
 
-fn dot_f64(a: &[f32], b: &[f32]) -> f64 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| f64::from(*x) * f64::from(*y))
-        .sum()
+/// Threads available for output-partitioned parallelism (1 if unknown).
+fn parallel_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+}
+
+/// Splits `buf` into contiguous chunks and runs `f(start, chunk)` on each,
+/// spawning threads only when the buffer is large enough to amortize the
+/// spawn. Chunks form a fixed partition of the buffer: every element belongs
+/// to exactly one chunk, so callers must keep each output element's value
+/// dependent only on its own chunk for thread-count-independent results.
+fn for_each_chunk_mut<T: Send>(
+    buf: &mut [T],
+    min_chunk: usize,
+    f: impl Fn(usize, &mut [T]) + Sync + Send,
+) {
+    if buf.is_empty() {
+        return;
+    }
+    let min_chunk = min_chunk.max(1);
+    let threads = parallel_threads();
+    let chunk = if threads <= 1 || buf.len() <= min_chunk {
+        buf.len()
+    } else {
+        let per_thread = buf.len().div_ceil(threads);
+        per_thread.div_ceil(min_chunk) * min_chunk
+    };
+    if chunk >= buf.len() {
+        f(0, buf);
+        return;
+    }
+    let f_ref = &f;
+    std::thread::scope(|scope| {
+        for (index, piece) in buf.chunks_mut(chunk).enumerate() {
+            let start = index * chunk;
+            scope.spawn(move || f_ref(start, piece));
+        }
+    });
+}
+
+/// Contiguous dot product with four independent f32 accumulators (fixed
+/// order, vectorizer-friendly).
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 4];
+    for (a_chunk, b_chunk) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        for lane in 0..4 {
+            acc[lane] += a_chunk[lane] * b_chunk[lane];
+        }
+    }
+    let mut total = acc[0] + acc[1] + acc[2] + acc[3];
+    let head = a.len() / 4 * 4;
+    for index in head..a.len() {
+        total += a[index] * b[index];
+    }
+    total
+}
+
+/// Rows per parallel task for a kernel whose per-row cost is `row_macs`
+/// multiply-accumulates: targets roughly 256k MACs per task.
+fn min_rows_for(row_macs: usize) -> usize {
+    ((262_144 / row_macs.max(1)) + 1).clamp(1, 256)
+}
+
+/// `out[batches, m, n] = a[batches, m, k] x b[batches, k, n]` per batch,
+/// f32 accumulation in fixed l order, rows split across a fixed partition.
+fn batched_nn_rows(
+    out: &mut [f32],
+    a: &[f32],
+    b: &[f32],
+    batches: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    let rows = batches * m;
+    if rows == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        out.fill(0.0);
+        return;
+    }
+    let min_rows = min_rows_for(k * n);
+    for_each_chunk_mut(out, min_rows * n, |start, chunk| {
+        let first_row = start / n;
+        let row_count = chunk.len() / n;
+        for r in 0..row_count {
+            let row = first_row + r;
+            let o = row / m;
+            let i = row % m;
+            let slot_row = &mut chunk[r * n..(r + 1) * n];
+            slot_row.fill(0.0);
+            let a_row = &a[(o * m + i) * k..(o * m + i + 1) * k];
+            for (l, &av) in a_row.iter().enumerate() {
+                let b_row = &b[(o * k + l) * n..(o * k + l + 1) * n];
+                for (slot, &bv) in slot_row.iter_mut().zip(b_row) {
+                    *slot += av * bv;
+                }
+            }
+        }
+    });
+}
+
+/// `out[batches, m, n] = a[batches, m, k] x b[batches, n, k]^T` per batch.
+/// The transposed operand is re-laid-out into `[k, n]` once per call so the
+/// product runs in the fast axpy form; rows are split across a fixed
+/// partition.
+fn batched_nt_rows(
+    out: &mut [f32],
+    a: &[f32],
+    b: &[f32],
+    batches: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let rows = batches * m;
+    if rows == 0 || n == 0 || k == 0 {
+        out.fill(0.0);
+        return;
+    }
+    let mut b_t = vec![0.0f32; batches * k * n];
+    transpose_nt(&mut b_t, b, n, k);
+    batched_nn_rows(out, a, &b_t, batches, m, k, n);
+}
+
+/// `dst[d, rows] = src[rows, d]^T` for one 2-D table; every output element
+/// is written exactly once, so the result is thread-count independent.
+fn transpose_dt(dst: &mut [f32], src: &[f32], rows: usize, d: usize) {
+    if rows == 0 || d == 0 {
+        return;
+    }
+    for_each_chunk_mut(dst, 8192, |start, chunk| {
+        let first_l = start / rows;
+        let count = chunk.len() / rows;
+        for r in 0..count {
+            let l = first_l + r;
+            let slot_row = &mut chunk[r * rows..(r + 1) * rows];
+            for (j, slot) in slot_row.iter_mut().enumerate() {
+                *slot = src[j * d + l];
+            }
+        }
+    });
+}
+
+/// `dst[batches, k, n] = b[batches, n, k]^T` per batch; every output element
+/// is written exactly once, so the result is thread-count independent.
+fn transpose_nt(dst: &mut [f32], b: &[f32], n: usize, k: usize) {
+    if n == 0 || k == 0 {
+        return;
+    }
+    for_each_chunk_mut(dst, 8192, |start, chunk| {
+        let first_row = start / n;
+        let row_count = chunk.len() / n;
+        for r in 0..row_count {
+            let row = first_row + r;
+            let o = row / k;
+            let l = row % k;
+            let slot_row = &mut chunk[r * n..(r + 1) * n];
+            for (j, slot) in slot_row.iter_mut().enumerate() {
+                *slot = b[(o * n + j) * k + l];
+            }
+        }
+    });
+}
+
+/// Gradients of `out[batches, m, n] = a[batches, m, k] x b[batches, k, n]`.
+#[allow(clippy::too_many_arguments)]
+fn batched_nn_backward_rows(
+    ga: &mut [f32],
+    gb: &mut [f32],
+    gy: &[f32],
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    let row_macs = k.max(1) * n.max(1);
+    let min_rows = min_rows_for(row_macs);
+    // ga[(o, i), l] = sum_j gy[(o, i), j] * b[(o, l), j] (dot form).
+    for_each_chunk_mut(ga, min_rows * k, |start, chunk| {
+        let first_row = start / k;
+        let row_count = chunk.len() / k;
+        for r in 0..row_count {
+            let row = first_row + r;
+            let o = row / m;
+            let i = row % m;
+            let gy_row = &gy[(o * m + i) * n..(o * m + i + 1) * n];
+            for l in 0..k {
+                chunk[r * k + l] = dot_f32(gy_row, &b[(o * k + l) * n..(o * k + l + 1) * n]);
+            }
+        }
+    });
+    // gb[(o, l), j] = sum_i a[(o, i), l] * gy[(o, i), j] (axpy over i).
+    for_each_chunk_mut(gb, min_rows * n, |start, chunk| {
+        let first_row = start / n;
+        let row_count = chunk.len() / n;
+        for r in 0..row_count {
+            let row = first_row + r;
+            let o = row / k;
+            let l = row % k;
+            let slot_row = &mut chunk[r * n..(r + 1) * n];
+            slot_row.fill(0.0);
+            for i in 0..m {
+                let s = a[(o * m + i) * k + l];
+                let gy_row = &gy[(o * m + i) * n..(o * m + i + 1) * n];
+                for (slot, &y) in slot_row.iter_mut().zip(gy_row) {
+                    *slot += s * y;
+                }
+            }
+        }
+    });
+}
+
+/// Gradients of `out[batches, m, n] = a[batches, m, k] x b[batches, n, k]^T`.
+#[allow(clippy::too_many_arguments)]
+fn batched_nt_backward_rows(
+    ga: &mut [f32],
+    gb: &mut [f32],
+    gy: &[f32],
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let row_macs = k.max(1) * n.max(1);
+    let min_rows = min_rows_for(row_macs);
+    // ga[(o, i), l] = sum_j gy[(o, i), j] * b[(o, j), l] (axpy over j).
+    for_each_chunk_mut(ga, min_rows * k, |start, chunk| {
+        let first_row = start / k;
+        let row_count = chunk.len() / k;
+        for r in 0..row_count {
+            let row = first_row + r;
+            let o = row / m;
+            let i = row % m;
+            let slot_row = &mut chunk[r * k..(r + 1) * k];
+            slot_row.fill(0.0);
+            for j in 0..n {
+                let s = gy[(o * m + i) * n + j];
+                let b_row = &b[(o * n + j) * k..(o * n + j + 1) * k];
+                for (slot, &bv) in slot_row.iter_mut().zip(b_row) {
+                    *slot += s * bv;
+                }
+            }
+        }
+    });
+    // gb[(o, j), l] = sum_i gy[(o, i), j] * a[(o, i), l] (axpy over i).
+    for_each_chunk_mut(gb, min_rows * k, |start, chunk| {
+        let first_row = start / k;
+        let row_count = chunk.len() / k;
+        for r in 0..row_count {
+            let row = first_row + r;
+            let o = row / n;
+            let j = row % n;
+            let slot_row = &mut chunk[r * k..(r + 1) * k];
+            slot_row.fill(0.0);
+            for i in 0..m {
+                let s = gy[(o * m + i) * n + j];
+                let a_row = &a[(o * m + i) * k..(o * m + i + 1) * k];
+                for (slot, &av) in slot_row.iter_mut().zip(a_row) {
+                    *slot += s * av;
+                }
+            }
+        }
+    });
 }
 
 /// Exact-erf GELU matching `torch.nn.GELU()` (no tanh approximation).

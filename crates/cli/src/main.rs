@@ -36,7 +36,7 @@ const fn usage() -> &'static str {
 [--resume] [--steps <count>] [--optimizer adamw|signtrust] [--token-budget <tokens>] \
 [--seq-len <n>] [--d-model <n>] [--layers <n>] [--heads <n>] [--ffn <n>] [--vocab <n>] \
 [--seed <n>] [--lr <f64>] [--warmup <steps>] [--eval-every <steps>] [--log-every <steps>] \
-[--floor-ratio <f64>] [--weight-decay <f64>] [--save-init <checkpoint>]"
+[--floor-ratio <f64>] [--weight-decay <f64>] [--save-init <checkpoint>] [--explain-step]"
 }
 
 fn value_at(args: &[String], flag: &str, index: &mut usize) -> Result<String, String> {
@@ -203,6 +203,7 @@ fn train(args: &[String]) -> Result<(), String> {
     let mut floor_ratio: f64 = 0.1;
     let mut weight_decay: f64 = 0.0;
     let mut save_init_path: Option<PathBuf> = None;
+    let mut explain = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -218,6 +219,9 @@ fn train(args: &[String]) -> Result<(), String> {
             }
             "--resume" => {
                 resume = true;
+            }
+            "--explain-step" => {
+                explain = true;
             }
             "--steps" => {
                 let raw = value_at(args, "--steps", &mut index)?;
@@ -333,6 +337,13 @@ fn train(args: &[String]) -> Result<(), String> {
         index += 1;
     }
 
+    if explain {
+        for line in byva_trainer::explain_step(&model).map_err(|error| error.to_string())? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
     let shards_dir = shards_dir.ok_or("missing --shards")?;
     let tokenizer_path = tokenizer_path.ok_or("missing --tokenizer")?;
     let out_path = out_path.ok_or("missing --out")?;
@@ -398,12 +409,20 @@ fn train(args: &[String]) -> Result<(), String> {
 
     let total = trainer.config().steps;
     let mut trained = 0u64;
+    let mut step_clock = std::time::Instant::now();
     while trainer.step() < total {
         let loss = trainer.train_step().map_err(|error| error.to_string())?;
         trained += 1;
         if log_every > 0 && trainer.step() % log_every == 0 {
-            eprintln!("step {}/{} loss {:.4}", trainer.step(), total, loss);
+            eprintln!(
+                "step {}/{} loss {:.4} ({:.3?}/step)",
+                trainer.step(),
+                total,
+                loss,
+                step_clock.elapsed()
+            );
         }
+        step_clock = std::time::Instant::now();
         if eval_every > 0 && trainer.step() % eval_every == 0 {
             trainer.save(&out_path).map_err(|error| error.to_string())?;
         }

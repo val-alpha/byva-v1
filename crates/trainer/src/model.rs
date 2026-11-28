@@ -130,6 +130,61 @@ fn dense(
     Ok(graph.reshape(product, &[rows, out_features])?)
 }
 
+/// Static plan of one training step (K1): the op schedule with shapes,
+/// derived from the config alone. `--explain-step` prints it so the per-step
+/// cost stays auditable without running data through the trainer.
+pub fn explain_step(config: &ModelConfig) -> Result<Vec<String>, TrainerError> {
+    config.validate()?;
+    let d = config.d_model;
+    let s = config.seq_len;
+    let ffn = config.ffn;
+    let mut lines = vec![format!(
+        "model: d={} seq={} layers={} heads={} head_dim={} ffn={} vocab={}",
+        d,
+        s,
+        config.n_layers,
+        config.n_heads,
+        config.head_dim(),
+        ffn,
+        config.vocab
+    )];
+    lines.push("  embed token_embedding.weight -> [tokens, d]".to_string());
+    lines.push("  add position_embedding rows   -> [tokens, d]".to_string());
+    for layer in 0..config.n_layers {
+        lines.push(format!("blocks.{layer}:"));
+        lines.push("    layer_norm (pre-attn)       -> [tokens, d]".to_string());
+        lines.push(format!(
+            "    dense qkv (x @ W^T)         -> [tokens, {}]",
+            3 * d
+        ));
+        lines.push("    slice q/k/v + heads_to_rows -> [batch*heads, seq, head_dim]".to_string());
+        lines.push("    scores = q @ k^T            -> [batch*heads, seq, seq]".to_string());
+        lines.push("    causal_softmax              -> [batch*heads, seq, seq]".to_string());
+        lines.push("    context = probs @ v         -> [batch*heads, seq, head_dim]".to_string());
+        lines.push("    rows_to_heads + dense out   -> [tokens, d]".to_string());
+        lines.push("    residual add                -> [tokens, d]".to_string());
+        lines.push("    layer_norm (pre-mlp)        -> [tokens, d]".to_string());
+        lines.push(format!(
+            "    dense ffn in (x @ W^T)      -> [tokens, {ffn}]"
+        ));
+        lines.push(format!(
+            "    gelu (exact erf)            -> [tokens, {ffn}]"
+        ));
+        lines.push(format!("    dense ffn out (x @ W^T)     -> [tokens, {d}]"));
+        lines.push("    residual add                -> [tokens, d]".to_string());
+    }
+    lines.push("  layer_norm (final_norm)       -> [tokens, d]".to_string());
+    lines.push(
+        "  cross_entropy_tied vs token_embedding (tied-logit-free; one [vocab] row at a time)"
+            .to_string(),
+    );
+    lines.push(
+        "  backward: reverse tape scan; optimizer update over the flat parameter buffer"
+            .to_string(),
+    );
+    Ok(lines)
+}
+
 /// Builds the full D-0013 forward pass and returns the scalar loss node
 /// (tied-logit-free softmax cross-entropy, K2).
 ///
