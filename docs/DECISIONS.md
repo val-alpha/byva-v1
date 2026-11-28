@@ -127,3 +127,33 @@ Add dated entries for material decisions. Record superseded decisions rather tha
 - Decision: `byva-train-checkpoint-v2` extends v1 with the GradScaler state (null when FP16 is off); the loader accepts v1 and v2 and rejects unknown formats. The reference trainer gains `--config {tiny,small}` (frozen D-0013 configurations), `--tokenizer <artifact>` (production BPE path; byte-level stays the explicit fallback per D-0015), `--device`, `--fp16` (CUDA autocast + GradScaler), and `--grad-accum N` (per-micro-batch backward, loss history records the accumulated mean cross-entropy so it is comparable across accumulation factors).
 - Rationale: The T4 gate requires a real FP16 run of the SMALL config, and Colab sessions die mid-run; a resumed run that drops scaler state would fork the loss trajectory exactly like lost RNG state.
 - Consequences: Phase 4 conversion must accept v2 checkpoints; resuming an FP16 run requires a v2 checkpoint (v1 loads only for FP32). Any further field addition bumps the format again per D-0014.
+## D-0019 — CPU-first performance budget and quality guardrails
+
+- Status: Accepted
+- Date: 2026-11-28
+- Decision: CPU speed is a first-class product requirement. The Rust runtime
+  (Phase 5) is designed against these single-thread greedy-decode budgets on a
+  documented reference CPU, measured with the Phase 7 harness before being
+  called met: TINY (11.7M params) ≥ 200 tokens/s and SMALL (42.5M params)
+  ≥ 50 tokens/s in fp32, with int8 weight quantization as the default CPU
+  path and int4 as opt-in. Quality is guarded, not assumed: a quantized or
+  optimized path may become default only after a recorded held-out loss/eval
+  delta against the fp32 reference stays within the threshold recorded in this
+  decision's first revision, measured on the Phase 3 bilingual held-out split.
+- Rationale: BYVA targets small models whose users run them on CPU-only
+  machines; "fast" must be a tracked budget with numbers, and "still smart"
+  must be a measured delta, or optimization silently trades one for the other.
+- Consequences: the runtime decode loop must be allocation-free per token
+  (preallocated buffers, contiguous row-major weights); SIMD paths (AVX2/NEON)
+  stay behind the backend abstraction with safe fallbacks and SAFETY-documented
+  unsafe (D-0006); first measured CPU decode numbers are recorded in
+  docs/PERFORMANCE.md when Phase 5 lands; budgets may be revised only with
+  measured evidence, never by editing the target silently.
+
+## D-0020 — Reconciliation of the parallel BPE trainers; exact byte-level trainer is canonical
+
+- Status: Accepted
+- Date: 2026-11-28
+- Decision: Two BPE trainers had evolved in parallel (`byva/implementation` f81c36d: word-type pre-tokenized trainer with a committed artifact; this branch: exact byte-level trainer matching `Tokenizer::encode_bytes`). The exact byte-level trainer is canonical because the Rust tokenizer serves through `encode_bytes` (no pre-tokenization), so training/serve segmentation is identical by construction (extends D-0017). The word-type trainer variant, its tests (`training/tests/test_bpe.py`), and its mini fixture are removed. The committed 32,768 artifact produced by the superseded trainer stays in place (it remains a valid table under byte-level serving) only until it is retrained by the canonical trainer and replaced together with a new training manifest (D-0007/D-0012 provenance rules apply).
+- Rationale: two live trainers with a duplicated D-0017 would let training and serving segmentation drift; the serving side is the fixed point, so the trainer must follow it.
+- Consequences: all future vocabulary training uses the canonical trainer path (scaled Rust trainer for large corpora, D-0021); any trainer change must keep the cross-language golden fixture byte-identical; artifact replacement requires a new manifest and updated Rust integration tests in the same commit.

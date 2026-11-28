@@ -117,12 +117,41 @@ Second real-dataset smoke run (same tiny config, byte-level, CPU):
 - **Real T4 training run** — the environment has no GPU. The gate item stays
   open; the SMALL_CONFIG run on Colab T4 (FP16 + gradient accumulation) is the
   remaining Phase 3/8 hardware task, with a Colab notebook to be prepared.
-- **BPE vocab training** — the 32,768-token merge table does not exist yet, so
-  dataset smokes train on byte ids (D-0015). Production pretraining requires
-  the trained tokenizer artifact.
 - **c4/wikipedia full-corpus shards** — needs multi-GB downloads and storage
   outside this environment.
 - **OSCAR-2301 sample** — gated dataset (HTTP 401); needs HF authentication.
+
+## Addendum (2026-11-28): BPE vocabulary trained (D-0017)
+
+The 32,768-vocabulary BPE table required by D-0015 now exists.
+
+- Corpus: the same five-source sample as the third smoke run (c4 `id` 1,500,
+  wikipedia `20231101.id` 1,200, fineweb-edu 1,000, wikipedia
+  `20231101.en` 800, TinyStories 800), re-fetched from datasets-server on
+  2026-11-28; the Phase 2 pipeline kept 5,288/5,300 docs into 6 shards,
+  shard manifest sha256
+  `f2e672d0c05c2a47b240177e101eebde8dd710c0f69e382b8e708a0d4ca124ef`.
+- Trainer: `training/train_bpe.py` (pure stdlib, deterministic per D-0017).
+  Runtime: 32 s on the build environment CPU. 244,687 word types.
+- Result: 32,465 merges (vocab 32,768 = 303 base tokens + merges).
+  Training-corpus compression: 41,366,863 bytes → 14,816,989 tokens
+  (2.79 bytes/token).
+- Held-out compression (240 fresh docs sampled at distant offsets from the
+  same four sampling sources, never in the training corpus): 898,058 bytes →
+  329,039 tokens = **2.73 bytes/token** (c4-id 2.80, wiki-id 2.88,
+  wiki-en 2.70, fineweb-edu 2.67).
+- Committed artifacts: `artifacts/tokenizer/byva-tokenizer-v1.json`
+  (sha256 `bb380795929e6ff89e3437ce1590928454727759bbec78a4e37f255d27b6cd77`)
+  and its training manifest `byva-tokenizer-v1.manifest.json`.
+- Validation actually run on this commit: new Rust integration test
+  `crates/tokenizer/tests/bpe_artifact.rs` (5 tests: artifact loads under the
+  published vocab bounds, bilingual round trips, compression, all 32,465
+  merges expand to bytes, control IDs stay outside content decoding) and
+  Python suite `training/tests/test_bpe.py` (12 tests including a frozen mini
+  fixture and a committed-artifact guard).
+- Still open: `training/train.py` continues to encode byte ids (D-0015);
+  wiring `--tokenizer` support into the trainer is the next step before the
+  real T4 run, so production pretraining consumes only this artifact.
 
 ## CI
 
