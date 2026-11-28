@@ -269,3 +269,55 @@ trainer code path the notebook uses.
   scale on CPU (TINY). The Phase 3 T4/SMALL gate item is superseded by user
   decision to defer Colab, not passed; revisit when GPU access returns.
 - Still open: full-corpus shards, production-scale BPE training, SMALL run.
+
+## Full-corpus local run (2026-11-28, session 2): scaled Rust trainer + TINY 2,000 steps
+
+### Scaled Rust trainer (D-0021)
+
+- Root-caused the cross-language divergence flagged by the 340-step probe: the
+  Python trainer replaces occurrences in `sorted(...)` (ascending document,
+  index) order while the first Rust version iterated a hash-set snapshot in
+  arbitrary order, so overlapping occurrences of the same pair applied in a
+  different order and counts drifted (the observed `('0',' ')` over-decrement).
+  Fixed by sorting the snapshot; a debug hook added during the investigation
+  was removed.
+- Retrained the production 32,768 artifact on the FULL local shard corpus
+  (9,962 docs, 97.9 MB): **5.01 bytes/token** (vs 5.53 on the 2.77 MB
+  subsample). 77 s per run on CPU; two independent runs byte-identical
+  (determinism verified).
+- Memory: the Python trainer OOM-kills on this machine around 20 MB of corpus
+  (cgroup ceiling 4.2 GB); the Rust trainer trains the 99 MB corpus in
+  ~1.5-2 GB RSS via u16 symbols, exact-capacity position vectors, and lazily
+  pruned position buckets (`crates/tokenizer/src/trainer.rs`).
+- Cross-language equivalence re-verified byte-identical at full 32k vocabulary
+  on the 2.77 MB shard sample plus the golden fixture tests (6/6).
+- Production artifact + provenance manifest (D-0007/D-0012) replaced in the
+  same commit; `bpe_artifact` integration tests 5/5 on the new table.
+
+### Model training (TINY on the new 32k table)
+
+- `train.py --config tiny --tokenizer artifacts/tokenizer/byva-tokenizer-v1.json
+  --device cpu --steps 2000 --seq-len 128 --batch-size 8`: ~34 min wall clock,
+  loss train 10.4575 -> 8.0682, val 8.0478 (monotone decrease; the earlier
+  200-step run peaked at 8.93).
+- Resume verified per D-0014/D-0018: `--resume` continued the v2 checkpoint
+  2,000 -> 2,800 steps with the loss history connected (8.05 -> ~7.7); config,
+  RNG states, optimizer, and scaler all reload.
+- Degenerate greedy continuation (single repeated token) is expected at this
+  scale and is covered by the dedicated generation unittest.
+
+### Decode baseline (proxy, NOT the D-0019 claim)
+
+- `training/bench_decode.py` (new): PyTorch reference TINY, fp32, greedy,
+  single thread, no KV cache: **26.6 tok/s median** (128 + 128 tokens).
+  The D-0019 budget (TINY >= 200 tok/s) is claimed only by the Rust runtime
+  with the Phase 7 harness; see docs/PERFORMANCE.md.
+
+### Gate status after this run
+
+- "Full-corpus shards + production-scale BPE training": DONE locally (99 MB,
+  Rust trainer, D-0021).
+- TINY long-run training with the production tokenizer: DONE locally
+  (2,000+ steps, resume verified).
+- Still open: SMALL/GPU run (Colab deferred), Phase 5 Rust runtime vs the
+  200 tok/s budget.

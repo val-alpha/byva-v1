@@ -72,10 +72,33 @@ Notes:
 - Load is a one-time cost per process and stays under 2 ms at production size.
 - Same 576 B bilingual sample as the 8k baseline for direct comparison.
 
+## Decoder reference proxy (PyTorch, training-side, NOT the D-0019 claim)
+
+Recorded 2026-11-28, same environment. `training/bench_decode.py` on the
+TINY checkpoint (11.7M params, fp32, greedy, no KV cache, full forward per
+token), PyTorch CPU, `torch.set_num_threads(1)`, prompt 128 + 128 new tokens,
+median of 5 runs:
+
+| Model | Threads | Median throughput |
+|---|---|---|
+| TINY (PyTorch reference) | 1 | 26.6 tok/s |
+
+This is the training-side baseline only. The D-0019 budget (TINY >= 200
+tok/s single-thread fp32 greedy) is claimed met exclusively by the Rust
+runtime measured with the Phase 7 harness; the reference implementation is
+~7.5x below budget, which is the headroom the Rust decode loop (incremental
+context, allocation-free per-token path) must recover and exceed.
+
+Reproduce:
+
+~~~bash
+python3 training/bench_decode.py --checkpoint <ckpt.pt>
+~~~
+
 ## What is deliberately absent
 
-- Inference/decoder benchmarks: the runtime crate has no execution engine yet
-  (Phase 5). No inference performance claim is possible or made.
+- Rust inference/decoder benchmarks: the runtime crate has no execution engine
+  yet (Phase 5). No D-0019 budget claim is possible or made from the proxy above.
 - GPU benchmarks: no GPU in this environment; will be recorded only after
   capability detection and validation on actual hardware (Phase 5/7).
 - Dataset/shard benchmarks: Phase 2 and later.
