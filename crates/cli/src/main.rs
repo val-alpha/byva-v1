@@ -26,18 +26,22 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("generate") => generate(&args[1..]),
         Some("convert") => convert(&args[1..]),
         Some("train") => train(&args[1..]),
+        Some("sft") => sft(&args[1..]),
         _ => Err(usage().to_string()),
     }
 }
 
 const fn usage() -> &'static str {
     "usage: byva-cli generate --weights <byva-weights-v1 file> --tokenizer <artifact.json> \
---prompt <text> [--max-new <count>]\n       byva-cli convert --checkpoint <training checkpoint> --out <byva-weights-v1 file>\n       byva-cli train --shards <dir with manifest.json> --tokenizer <artifact.json> --out <checkpoint> \
+--prompt <text> [--max-new <count>] [--chat]\n       byva-cli convert --checkpoint <training checkpoint> --out <byva-weights-v1 file>\n       byva-cli train --shards <dir with manifest.json> --tokenizer <artifact.json> --out <checkpoint> \
 [--resume] [--steps <count>] [--optimizer adamw|signtrust] [--token-budget <tokens>] \
 [--seq-len <n>] [--d-model <n>] [--layers <n>] [--heads <n>] [--ffn <n>] [--vocab <n>] \
 [--seed <n>] [--lr <f64>] [--warmup <steps>] [--eval-every <steps>] [--log-every <steps>] \
 [--floor-ratio <f64>] [--weight-decay <f64>] [--save-init <checkpoint>] [--explain-step] \
-[--lang-share-id <f64>] [--lang-band <f64>]"
+[--lang-share-id <f64>] [--lang-band <f64>]\n       byva-cli sft --base <rust checkpoint> --tokenizer <artifact.json> --out <checkpoint> \
+(--sft-data <jsonl> | --identity) [--repeat <count>] [--resume] [--steps <count>] [--lr <f64>] \
+[--seq-len <n>] [--token-budget <tokens>] [--seed <n>] [--weight-decay <f64>] \
+[--eval-every <steps>] [--log-every <steps>]"
 }
 
 fn value_at(args: &[String], flag: &str, index: &mut usize) -> Result<String, String> {
@@ -52,6 +56,7 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mut tokenizer_path: Option<PathBuf> = None;
     let mut prompt: Option<String> = None;
     let mut max_new_tokens: u32 = 64;
+    let mut chat = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -61,6 +66,9 @@ fn generate(args: &[String]) -> Result<(), String> {
             }
             "--tokenizer" => {
                 tokenizer_path = Some(PathBuf::from(value_at(args, "--tokenizer", &mut index)?));
+            }
+            "--chat" => {
+                chat = true;
             }
             "--prompt" => {
                 prompt = Some(value_at(args, "--prompt", &mut index)?);
@@ -85,7 +93,13 @@ fn generate(args: &[String]) -> Result<(), String> {
     let model = InferenceModel::from_weights(weights).map_err(|error| error.to_string())?;
 
     let mut tokens = vec![SpecialToken::Bos.id()];
-    tokens.extend(tokenizer.encode_content(&prompt));
+    if chat {
+        tokens.push(SpecialToken::User.id());
+        tokens.extend(tokenizer.encode_content(&prompt));
+        tokens.push(SpecialToken::Assistant.id());
+    } else {
+        tokens.extend(tokenizer.encode_content(&prompt));
+    }
 
     let mut session = model.new_session();
     let end_id = SpecialToken::End.id();
@@ -488,6 +502,250 @@ fn train(args: &[String]) -> Result<(), String> {
     if let Some(record) = trainer.eval_history().last() {
         println!(
             "last held-out loss: {:.4} (step {})",
+            record.loss, record.step
+        );
+    }
+    println!("checkpoint: {}", out_path.display());
+    Ok(())
+}
+
+fn sft(args: &[String]) -> Result<(), String> {
+    let mut base_path: Option<PathBuf> = None;
+    let mut tokenizer_path: Option<PathBuf> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut sft_data: Option<PathBuf> = None;
+    let mut identity = false;
+    let mut repeat: usize = 16;
+    let mut resume = false;
+    let mut steps_opt: Option<u64> = None;
+    let mut learning_rate: Option<f64> = None;
+    let mut seq_len_opt: Option<usize> = None;
+    let mut token_budget_opt: Option<usize> = None;
+    let mut seed: u64 = 0;
+    let mut weight_decay: f64 = 0.0;
+    let mut warmup_steps: u64 = 0;
+    let mut eval_every: u64 = 20;
+    let mut log_every: u64 = 10;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--base" => {
+                base_path = Some(PathBuf::from(value_at(args, "--base", &mut index)?));
+            }
+            "--tokenizer" => {
+                tokenizer_path = Some(PathBuf::from(value_at(args, "--tokenizer", &mut index)?));
+            }
+            "--out" => {
+                out_path = Some(PathBuf::from(value_at(args, "--out", &mut index)?));
+            }
+            "--sft-data" => {
+                sft_data = Some(PathBuf::from(value_at(args, "--sft-data", &mut index)?));
+            }
+            "--identity" => {
+                identity = true;
+            }
+            "--repeat" => {
+                let raw = value_at(args, "--repeat", &mut index)?;
+                repeat = raw
+                    .parse()
+                    .map_err(|_| format!("--repeat requires a number; {}", usage()))?;
+            }
+            "--resume" => {
+                resume = true;
+            }
+            "--steps" => {
+                let raw = value_at(args, "--steps", &mut index)?;
+                steps_opt = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--steps requires a number; {}", usage()))?,
+                );
+            }
+            "--lr" => {
+                let raw = value_at(args, "--lr", &mut index)?;
+                learning_rate = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--lr requires a number; {}", usage()))?,
+                );
+            }
+            "--seq-len" => {
+                let raw = value_at(args, "--seq-len", &mut index)?;
+                seq_len_opt = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--seq-len requires a number; {}", usage()))?,
+                );
+            }
+            "--token-budget" => {
+                let raw = value_at(args, "--token-budget", &mut index)?;
+                token_budget_opt = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--token-budget requires a number; {}", usage()))?,
+                );
+            }
+            "--seed" => {
+                let raw = value_at(args, "--seed", &mut index)?;
+                seed = raw
+                    .parse()
+                    .map_err(|_| format!("--seed requires a number; {}", usage()))?;
+            }
+            "--weight-decay" => {
+                let raw = value_at(args, "--weight-decay", &mut index)?;
+                weight_decay = raw
+                    .parse()
+                    .map_err(|_| format!("--weight-decay requires a number; {}", usage()))?;
+            }
+            "--warmup" => {
+                let raw = value_at(args, "--warmup", &mut index)?;
+                warmup_steps = raw
+                    .parse()
+                    .map_err(|_| format!("--warmup requires a number; {}", usage()))?;
+            }
+            "--eval-every" => {
+                let raw = value_at(args, "--eval-every", &mut index)?;
+                eval_every = raw
+                    .parse()
+                    .map_err(|_| format!("--eval-every requires a number; {}", usage()))?;
+            }
+            "--log-every" => {
+                let raw = value_at(args, "--log-every", &mut index)?;
+                log_every = raw
+                    .parse()
+                    .map_err(|_| format!("--log-every requires a number; {}", usage()))?;
+            }
+            other => return Err(format!("unknown argument {other:?}; {}", usage())),
+        }
+        index += 1;
+    }
+
+    let tokenizer_path = tokenizer_path.ok_or("missing --tokenizer")?;
+    let out_path = out_path.ok_or("missing --out")?;
+    let data_source = match (sft_data, identity) {
+        (Some(_), true) => {
+            return Err("--sft-data and --identity are mutually exclusive".to_string());
+        }
+        (None, false) => return Err("missing --sft-data or --identity".to_string()),
+        (Some(path), false) => {
+            byva_trainer::load_examples(&path).map_err(|error| error.to_string())?
+        }
+        (None, true) => byva_trainer::identity_examples(),
+    };
+
+    let dataset_source = if resume {
+        out_path.clone()
+    } else {
+        base_path.clone().ok_or("missing --base")?
+    };
+    let base_model = byva_trainer::load(&dataset_source)
+        .map_err(|error| error.to_string())?
+        .meta
+        .config
+        .model;
+    let seq_len = seq_len_opt.unwrap_or(base_model.seq_len);
+    if seq_len > base_model.seq_len {
+        return Err(format!(
+            "--seq-len {seq_len} exceeds the base checkpoint's seq_len {}",
+            base_model.seq_len
+        ));
+    }
+    let token_budget = token_budget_opt.unwrap_or_else(|| 8 * seq_len);
+    let learning_rate = learning_rate.unwrap_or(1e-3);
+
+    let tokenizer = load_tokenizer(&tokenizer_path)?;
+    let dataset = byva_trainer::build_dataset(&tokenizer, &data_source, repeat, seq_len)
+        .map_err(|error| error.to_string())?;
+
+    let mut trainer = if resume {
+        let mut trainer = Trainer::resume_masked(
+            &out_path,
+            dataset.packed.train().clone(),
+            dataset.packed.val().clone(),
+            dataset.train_mask.clone(),
+            dataset.val_mask.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(steps) = steps_opt {
+            trainer
+                .set_total_steps(steps)
+                .map_err(|error| error.to_string())?;
+        }
+        trainer
+    } else {
+        let base_path = base_path.ok_or("missing --base")?;
+        let config = byva_trainer::TrainConfig {
+            model: byva_trainer::ModelConfig {
+                vocab: base_model.vocab,
+                d_model: base_model.d_model,
+                n_layers: base_model.n_layers,
+                n_heads: base_model.n_heads,
+                ffn: base_model.ffn,
+                seq_len,
+            },
+            optimizer: byva_trainer::OptimizerKind::AdamW,
+            learning_rate,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay,
+            clamp_min: 0.25,
+            clamp_max: 4.0,
+            steps: steps_opt.unwrap_or(200),
+            token_budget,
+            seed,
+            warmup_steps,
+            floor_ratio: 0.1,
+            eval_every,
+            eval_rows: 64,
+            mixture_target_id: None,
+            mixture_band: 0.1,
+        };
+        Trainer::fine_tune(
+            &base_path,
+            config,
+            dataset.packed.train().clone(),
+            dataset.packed.val().clone(),
+            Some(dataset.train_mask.clone()),
+            Some(dataset.val_mask.clone()),
+        )
+        .map_err(|error| error.to_string())?
+    };
+
+    let total = trainer.config().steps;
+    let mut trained = 0u64;
+    let mut step_clock = std::time::Instant::now();
+    while trainer.step() < total {
+        let loss = trainer.train_step().map_err(|error| error.to_string())?;
+        trained += 1;
+        if log_every > 0 && trainer.step() % log_every == 0 {
+            eprintln!(
+                "sft step {}/{} loss {:.4} ({:.3?}/step)",
+                trainer.step(),
+                total,
+                loss,
+                step_clock.elapsed()
+            );
+        }
+        step_clock = std::time::Instant::now();
+        if eval_every > 0 && trainer.step() % eval_every == 0 {
+            if let Some(record) = trainer.eval_history().last() {
+                eprintln!("sft eval: step {} held-out {:.4}", record.step, record.loss);
+            }
+            trainer.save(&out_path).map_err(|error| error.to_string())?;
+        }
+    }
+    trainer.save(&out_path).map_err(|error| error.to_string())?;
+
+    println!(
+        "sft: {trained} step(s) in this invocation (total step {}), {} token(s)/step, {} example(s) x{repeat}, masked loss on response tokens only",
+        trainer.step(),
+        trainer.tokens_per_step(),
+        data_source.len()
+    );
+    if let Some(last) = trainer.loss_history().last() {
+        println!("last sft loss: {last:.4}");
+    }
+    if let Some(record) = trainer.eval_history().last() {
+        println!(
+            "last held-out sft loss: {:.4} (step {})",
             record.loss, record.step
         );
     }

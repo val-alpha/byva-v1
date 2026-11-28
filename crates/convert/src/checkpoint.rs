@@ -8,11 +8,13 @@
 use byva_model::ModelConfig;
 
 use crate::error::ConvertError;
-use crate::pickle::{self, StorageRef, StorageResolver, TensorData, Value};
+use crate::pickle::{self, DType, StorageRef, StorageResolver, TensorData, Value};
 use crate::zip::{self, ZipEntry};
 
 const FORMAT_V1: &str = "byva-train-checkpoint-v1";
 const FORMAT_V2: &str = "byva-train-checkpoint-v2";
+const FORMAT_RUST: &str = "byva-train-rust-checkpoint-v1";
+const RUST_MAGIC: [u8; 8] = *b"BYVATRCK";
 
 /// A parsed `byva-train-checkpoint-v1`/`-v2` payload.
 #[derive(Debug, Clone)]
@@ -61,13 +63,17 @@ impl StorageResolver for ZipResolver<'_> {
 }
 
 impl Checkpoint {
-    /// Parses a checkpoint archive from raw bytes.
+    /// Parses a checkpoint from raw bytes: a `byva-train-rust-checkpoint-v1`
+    /// payload (native format, Phase 6 path) or a PyTorch zip archive.
     ///
     /// # Errors
     /// Fails when the archive or pickle is malformed, the format string is
     /// unsupported, a v1 payload carries scaler state, or the config fails
     /// validation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConvertError> {
+        if bytes.len() >= 8 && bytes[..8] == RUST_MAGIC {
+            return Self::from_rust_bytes(bytes);
+        }
         let entries = zip::read_directory(bytes)?;
         let resolver = ZipResolver {
             bytes,
@@ -134,6 +140,67 @@ impl Checkpoint {
             source,
         })?;
         Self::from_bytes(&bytes)
+    }
+
+    /// Parses a native `byva-train-rust-checkpoint-v1` payload (D-0022):
+    /// magic + version header, JSON metadata, little-endian f32 blobs, and
+    /// sha256 trailer. Parameter blobs are surfaced in checkpoint order; the
+    /// converter reorders them into the canonical runtime layout.
+    fn from_rust_bytes(bytes: &[u8]) -> Result<Self, ConvertError> {
+        let loaded = byva_trainer::load_bytes(bytes)
+            .map_err(|error| ConvertError::NativeCheckpoint(error.to_string()))?;
+        if loaded.meta.format != FORMAT_RUST {
+            return Err(ConvertError::UnsupportedFormat {
+                got: loaded.meta.format,
+            });
+        }
+        let model = loaded.meta.config.model;
+        let config = ModelConfig {
+            vocab_size: u32::try_from(model.vocab).map_err(|_| ConvertError::InvalidConfig {
+                source: byva_model::ConfigError::DimensionMustBePositive { name: "vocab_size" },
+            })?,
+            d_model: u32::try_from(model.d_model).map_err(|_| ConvertError::InvalidConfig {
+                source: byva_model::ConfigError::DimensionMustBePositive { name: "d_model" },
+            })?,
+            n_layers: u32::try_from(model.n_layers).map_err(|_| ConvertError::InvalidConfig {
+                source: byva_model::ConfigError::DimensionMustBePositive { name: "n_layers" },
+            })?,
+            n_heads: u32::try_from(model.n_heads).map_err(|_| ConvertError::InvalidConfig {
+                source: byva_model::ConfigError::DimensionMustBePositive { name: "n_heads" },
+            })?,
+            ffn_hidden: u32::try_from(model.ffn).map_err(|_| ConvertError::InvalidConfig {
+                source: byva_model::ConfigError::DimensionMustBePositive { name: "ffn_hidden" },
+            })?,
+            max_seq_len: u32::try_from(model.seq_len).map_err(|_| ConvertError::InvalidConfig {
+                source: byva_model::ConfigError::DimensionMustBePositive {
+                    name: "max_seq_len",
+                },
+            })?,
+            tie_embeddings: true,
+        };
+        let mut model_tensors = Vec::with_capacity(loaded.meta.params.len());
+        let mut cursor = 0usize;
+        for spec in &loaded.meta.params {
+            let mut data = Vec::with_capacity(spec.len * 4);
+            for value in &loaded.params[cursor..cursor + spec.len] {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            cursor += spec.len;
+            model_tensors.push((
+                spec.name.clone(),
+                TensorData {
+                    dtype: DType::Float,
+                    shape: vec![spec.len as u64],
+                    data,
+                },
+            ));
+        }
+        Ok(Self {
+            format: loaded.meta.format,
+            step: loaded.meta.step,
+            config,
+            model: model_tensors,
+        })
     }
 }
 

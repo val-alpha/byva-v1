@@ -7,8 +7,10 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+byva-data = { path = "../data" }
 byva-model = { path = "../model" }
 byva-runtime = { path = "../runtime" }
+byva-trainer = { path = "../trainer" }
 thiserror.workspace = true
 
 [lints]

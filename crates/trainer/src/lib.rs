@@ -14,15 +14,20 @@ mod config;
 mod error;
 mod model;
 mod rng;
+mod sft;
 mod training;
 
 pub use byva_data::Lang;
 pub use checkpoint::{
     CheckpointMeta, EvalRecord, FORMAT_ID, LoadedCheckpoint, MixtureRecord, MixtureState,
-    OptimStateDesc, TensorDesc,
+    OptimStateDesc, TensorDesc, load, load_bytes, save,
 };
 pub use config::{ModelConfig, OptimizerKind, TrainConfig};
 pub use error::TrainerError;
 pub use model::{ParamLayout, ParamSpec, build_layout, explain_step, forward, init_params};
 pub use rng::SplitMix64;
+pub use sft::{
+    SftDataset, SftExample, build_dataset, canonical_text, identity_examples, load_examples,
+    render_stream,
+};
 pub use training::Trainer;

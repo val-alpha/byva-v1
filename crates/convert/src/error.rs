@@ -93,6 +93,9 @@ pub enum ConvertError {
         /// Format string found.
         got: String,
     },
+    /// A native Rust training checkpoint failed to parse or validate.
+    #[error("native Rust checkpoint rejected: {0}")]
+    NativeCheckpoint(String),
     /// A v1 checkpoint carries scaler state, which D-0018 forbids.
     #[error("v1 checkpoint carries scaler state; v1 must not have scaler state per D-0018")]
     V1WithScaler,

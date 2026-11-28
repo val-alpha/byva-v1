@@ -241,3 +241,43 @@ Add dated entries for material decisions. Record superseded decisions rather tha
   code; weight-layout assumptions (`[out, in]` Linear, fused `[3d, d]` QKV)
   are shared with the runtime via `canonical_tensor_layout`, so a D-0013
   architecture change updates both sides in one commit.
+
+## D-0025 — Phase 6 SFT: masked-loss chat template, built-in byva/BYV identity dataset, Rust-checkpoint convert path
+
+- Status: Accepted
+- Date: 2026-11-28
+- Decision: Supervised fine-tuning renders each example as
+  `<|bos|>|user|>{prompt}|assistant|>{response}<|end|>` with the tokenizer's
+  existing control tokens (no vocabulary change) and trains with loss masked
+  to the response tokens plus the closing `<|end|>` only. Examples are
+  GPT-style packed into a concatenated stream (windows `seq_len + 1`,
+  canonical 90/10 split, per-target weight masks); batches with no supervised
+  position contribute loss 0.0 and skip the optimizer update, and evaluation
+  selects only supervised windows. `fine_tune` starts from a native Rust
+  checkpoint (dims must match except `seq_len` may be shorter, with the
+  position-embedding prefix carried over) and uses a fresh optimizer.
+  Checkpoints record `masked_loss` in the manifest, and plain/masked resume
+  must agree with it. SFT data is JSONL
+  (`{"id","prompt","response"}`, `id == sha256_hex(NFC(prompt+"\n"+response))[:16]`)
+  or the built-in bilingual byva identity dataset
+  (`--identity`, upsampled by `--repeat`). `byva_convert` accepts the native
+  Rust checkpoint (`byva-train-rust-checkpoint-v1`, `BYVATRCK` magic) and the
+  CLI gains `sft` plus `generate --chat`. The model identity is fixed as:
+  name **byva**, creator **BYV Dev Unorganization (BYV)** with the
+  real-world identity undisclosed (no guessing, inferring, or inventing a
+  personal identity), answering in Indonesian and English; the identity
+  dataset encodes exactly this attribution. The Phase 6 identity gate is a
+  smoke-scale check (`training/bench_sft.py`); the full Phase 6 scope
+  (held-out format, schema, tool-selection, multi-step evaluations) remains
+  open.
+- Rationale: masking keeps pretraining knowledge from being diluted by
+  prompt tokens; reusing the existing control tokens avoids a vocab/parity
+  migration (D-0013/D-0023 fixtures stay valid); the native Rust checkpoint
+  convert path removes the last PyTorch dependency from the serve chain
+  (D-0024) so fine-tuning feeds the runtime directly.
+- Consequences: any template or mask change must re-run the identity gate
+  and the convert→runtime parity test; `resume`/`resume_masked` selection is
+  now part of the checkpoint contract (manifest `masked_loss` flag); the
+  built-in identity dataset is authoritative for byva/BYV attribution and
+  must not be edited to name any personal identity; full Phase 6 tool-behavior
+  evaluations are tracked as open work.

@@ -49,6 +49,18 @@ pub fn token_stream(length: usize) -> Vec<u32> {
     (0..length as u32).map(|i| (i * 37 + 11) % 64).collect()
 }
 
+/// A pseudo-random token stream over a 384-token vocabulary (byte-token
+/// range plus merge ids; used by the Phase 6 SFT tests whose datasets carry
+/// real UTF-8 text tokenized through byte tokens).
+pub fn token_stream_utf8(length: usize) -> Vec<u32> {
+    (0..length as u32).map(|i| (i * 89 + 17) % 384).collect()
+}
+
+/// A packed dataset over [`token_stream_utf8`] at seq_len 8.
+pub fn packed_utf8() -> Packed {
+    pack(&token_stream_utf8(600), 8).unwrap_or_else(|e| panic!("{e}"))
+}
+
 /// A packed dataset with 59 train / 7 val windows at seq_len 8.
 pub fn packed() -> Packed {
     pack(&token_stream(600), 8).unwrap_or_else(|e| panic!("{e}"))
