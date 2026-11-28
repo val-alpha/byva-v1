@@ -36,7 +36,8 @@ const fn usage() -> &'static str {
 [--resume] [--steps <count>] [--optimizer adamw|signtrust] [--token-budget <tokens>] \
 [--seq-len <n>] [--d-model <n>] [--layers <n>] [--heads <n>] [--ffn <n>] [--vocab <n>] \
 [--seed <n>] [--lr <f64>] [--warmup <steps>] [--eval-every <steps>] [--log-every <steps>] \
-[--floor-ratio <f64>] [--weight-decay <f64>] [--save-init <checkpoint>] [--explain-step]"
+[--floor-ratio <f64>] [--weight-decay <f64>] [--save-init <checkpoint>] [--explain-step] \
+[--lang-share-id <f64>] [--lang-band <f64>]"
 }
 
 fn value_at(args: &[String], flag: &str, index: &mut usize) -> Result<String, String> {
@@ -204,6 +205,8 @@ fn train(args: &[String]) -> Result<(), String> {
     let mut weight_decay: f64 = 0.0;
     let mut save_init_path: Option<PathBuf> = None;
     let mut explain = false;
+    let mut lang_share_id: Option<f64> = None;
+    let mut lang_band: f64 = 0.1;
 
     let mut index = 0;
     while index < args.len() {
@@ -320,6 +323,19 @@ fn train(args: &[String]) -> Result<(), String> {
             "--save-init" => {
                 save_init_path = Some(PathBuf::from(value_at(args, "--save-init", &mut index)?));
             }
+            "--lang-share-id" => {
+                let raw = value_at(args, "--lang-share-id", &mut index)?;
+                lang_share_id = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--lang-share-id requires a number; {}", usage()))?,
+                );
+            }
+            "--lang-band" => {
+                let raw = value_at(args, "--lang-band", &mut index)?;
+                lang_band = raw
+                    .parse()
+                    .map_err(|_| format!("--lang-band requires a number; {}", usage()))?;
+            }
             "--eval-every" => {
                 let raw = value_at(args, "--eval-every", &mut index)?;
                 eval_every = raw
@@ -356,18 +372,33 @@ fn train(args: &[String]) -> Result<(), String> {
     let shards =
         byva_data::load_shards(&manifest, &shards_dir).map_err(|error| error.to_string())?;
     let mut stream: Vec<u32> = Vec::new();
+    let mut doc_langs: Vec<byva_data::DocLang> = Vec::new();
     for shard in &shards {
         for document in shard.documents() {
-            stream.extend(
-                tokenizer
-                    .encode_content(document.text())
-                    .into_iter()
-                    .map(|token| token.get()),
-            );
+            let encoded: Vec<u32> = tokenizer
+                .encode_content(document.text())
+                .into_iter()
+                .map(|token| token.get())
+                .collect();
+            doc_langs.push(byva_data::DocLang {
+                start: stream.len(),
+                len: encoded.len(),
+                lang: byva_data::detect_language(document.text()),
+            });
+            stream.extend(encoded);
         }
     }
 
-    let packed = byva_data::pack(&stream, model.seq_len).map_err(|error| error.to_string())?;
+    let (packed, tags) = if lang_share_id.is_some() {
+        let tagged = byva_data::pack_with_languages(&stream, &doc_langs, model.seq_len)
+            .map_err(|error| error.to_string())?;
+        (tagged.packed, Some((tagged.train_langs, tagged.val_langs)))
+    } else {
+        (
+            byva_data::pack(&stream, model.seq_len).map_err(|error| error.to_string())?,
+            None,
+        )
+    };
     let mut trainer = if resume {
         let mut trainer = Trainer::resume(&out_path, packed.train().clone(), packed.val().clone())
             .map_err(|error| error.to_string())?;
@@ -396,10 +427,17 @@ fn train(args: &[String]) -> Result<(), String> {
             floor_ratio,
             eval_every,
             eval_rows: 200,
+            mixture_target_id: lang_share_id,
+            mixture_band: lang_band,
         };
         Trainer::new(config, packed.train().clone(), packed.val().clone())
             .map_err(|error| error.to_string())?
     };
+    if let Some((train_langs, val_langs)) = tags {
+        trainer
+            .set_language_tags(train_langs, val_langs)
+            .map_err(|error| error.to_string())?;
+    }
     if let Some(init_path) = save_init_path {
         trainer
             .save(&init_path)
@@ -424,6 +462,12 @@ fn train(args: &[String]) -> Result<(), String> {
         }
         step_clock = std::time::Instant::now();
         if eval_every > 0 && trainer.step() % eval_every == 0 {
+            if let Some(record) = trainer.mixture_history().last() {
+                eprintln!(
+                    "mixture: step {} id_share {:.3} (id {:.4} en {:.4})",
+                    record.step, record.id_share, record.id_loss, record.en_loss
+                );
+            }
             trainer.save(&out_path).map_err(|error| error.to_string())?;
         }
     }

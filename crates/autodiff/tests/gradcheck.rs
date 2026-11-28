@@ -14,7 +14,7 @@ const REL_TOL: f64 = 3e-2;
 fn weighted_loss(g: &mut Graph, out: NodeId) -> Result<NodeId, AutodiffError> {
     let count: usize = g.value(out)?.shape().iter().product();
     let weights: Vec<f32> = (0..count)
-        .map(|k| (((k * 37) % 11) as f32 - 5.0) / 7.0)
+        .map(|k| ((((k * 37) % 11) as f32 - 5.0) / 7.0) / count as f32)
         .collect();
     let weights_id = g.leaf(&[count], weights)?;
     let flat = g.reshape(out, &[count])?;
@@ -272,7 +272,8 @@ proptest! {
             let merged = g.rows_to_heads(ctx, 2)?;
             let merged = g.reshape(merged, &[6, 4])?;
             let out = g.matmul(merged, ids[2])?;
-            g.cross_entropy_tied(out, ids[3], &targets)
+            let ce = g.cross_entropy_tied(out, ids[3], &targets)?;
+            g.mul_scalar(ce, 0.1)
         };
         assert_grads_match(&build, &shapes, &[x, w_qkv, w_out, table]);
     }

@@ -16,8 +16,10 @@ mod model;
 mod rng;
 mod training;
 
+pub use byva_data::Lang;
 pub use checkpoint::{
-    CheckpointMeta, EvalRecord, FORMAT_ID, LoadedCheckpoint, OptimStateDesc, TensorDesc,
+    CheckpointMeta, EvalRecord, FORMAT_ID, LoadedCheckpoint, MixtureRecord, MixtureState,
+    OptimStateDesc, TensorDesc,
 };
 pub use config::{ModelConfig, OptimizerKind, TrainConfig};
 pub use error::TrainerError;

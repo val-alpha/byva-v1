@@ -10,13 +10,15 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod error;
+mod lang;
 mod manifest;
 mod pack;
 mod sha256;
 mod shard;
 
 pub use error::DataError;
+pub use lang::{DocLang, Lang, detect_language, window_langs};
 pub use manifest::{Manifest, ShardConfig, ShardEntry, ShardStats, SourceEntry};
-pub use pack::{Packed, Sequences, WindowPacker, pack};
+pub use pack::{Packed, Sequences, TaggedPacked, WindowPacker, pack, pack_with_languages};
 pub use sha256::{Sha256, sha256_hex};
 pub use shard::{Shard, ShardDocument, load_shards};

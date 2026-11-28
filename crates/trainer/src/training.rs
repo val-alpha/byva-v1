@@ -4,9 +4,12 @@
 //! checkpointing.
 
 use byva_autodiff::{AdamW, AdamWConfig, Graph, NodeId, SignTrust, SignTrustConfig};
-use byva_data::Sequences;
+use byva_data::{Lang, Sequences};
 
-use crate::checkpoint::{self, CheckpointMeta, EvalRecord, FORMAT_ID, OptimStateDesc, TensorDesc};
+use crate::checkpoint::{
+    self, CheckpointMeta, EvalRecord, FORMAT_ID, MixtureRecord, MixtureState, OptimStateDesc,
+    TensorDesc,
+};
 use crate::config::OptimizerKind;
 use crate::config::TrainConfig;
 use crate::error::TrainerError;
@@ -93,6 +96,16 @@ pub struct Trainer {
     batch_cursor: usize,
     loss_history: Vec<f32>,
     eval_history: Vec<EvalRecord>,
+    train_langs: Option<Vec<Lang>>,
+    val_langs: Option<Vec<Lang>>,
+    id_rows: Vec<usize>,
+    en_rows: Vec<usize>,
+    val_id_rows: Vec<usize>,
+    val_en_rows: Vec<usize>,
+    id_cursor: usize,
+    en_cursor: usize,
+    id_share: f64,
+    mixture_history: Vec<MixtureRecord>,
 }
 
 impl Trainer {
@@ -156,6 +169,7 @@ impl Trainer {
                 )?)
             }
         };
+        let id_share = config.mixture_target_id.unwrap_or(0.0);
         Ok(Self {
             eval_rows: config.eval_rows.min(val.count()),
             config,
@@ -169,7 +183,70 @@ impl Trainer {
             batch_cursor: 0,
             loss_history: Vec::new(),
             eval_history: Vec::new(),
+            train_langs: None,
+            val_langs: None,
+            id_rows: Vec::new(),
+            en_rows: Vec::new(),
+            val_id_rows: Vec::new(),
+            val_en_rows: Vec::new(),
+            id_cursor: 0,
+            en_cursor: 0,
+            id_share,
+            mixture_history: Vec::new(),
         })
+    }
+
+    /// Attaches per-window language tags for the K5 id:en mixture (D-0016).
+    ///
+    /// One tag per train window and one per val window, in window order. When
+    /// the mixture is enabled the trainer pools windows per language, samples
+    /// each step's batch from the pools at the current Indonesian share, and
+    /// adapts that share at every evaluation within the configured band.
+    pub fn set_language_tags(
+        &mut self,
+        train: Vec<Lang>,
+        val: Vec<Lang>,
+    ) -> Result<(), TrainerError> {
+        let invalid = |reason: String| TrainerError::DataInvalid { reason };
+        if train.len() != self.train.count() {
+            return Err(invalid(format!(
+                "{} train language tags for {} train windows",
+                train.len(),
+                self.train.count()
+            )));
+        }
+        if val.len() != self.val.count() {
+            return Err(invalid(format!(
+                "{} val language tags for {} val windows",
+                val.len(),
+                self.val.count()
+            )));
+        }
+        if self.config.mixture_target_id.is_some() {
+            let id_train = train.iter().filter(|lang| **lang == Lang::Id).count();
+            if id_train == 0 || id_train == train.len() {
+                return Err(invalid(format!(
+                    "mixture needs both languages in the train split, found {}/{} id windows",
+                    id_train,
+                    train.len()
+                )));
+            }
+        }
+        let pool = |langs: &[Lang], lang: Lang| {
+            langs
+                .iter()
+                .enumerate()
+                .filter(|(_, tag)| **tag == lang)
+                .map(|(row, _)| row)
+                .collect::<Vec<usize>>()
+        };
+        self.val_id_rows = pool(&val, Lang::Id);
+        self.val_en_rows = pool(&val, Lang::En);
+        self.id_rows = pool(&train, Lang::Id);
+        self.en_rows = pool(&train, Lang::En);
+        self.train_langs = Some(train);
+        self.val_langs = Some(val);
+        Ok(())
     }
 
     /// Restores a trainer from a checkpoint plus the same packed sequences.
@@ -212,6 +289,11 @@ impl Trainer {
                 meta.batch_cursor,
                 train.count()
             )));
+        }
+        if meta.mixture_state.is_some() && config.mixture_target_id.is_none() {
+            return Err(mismatch(
+                "checkpoint holds mixture state but its config disables the mixture".to_string(),
+            ));
         }
         if meta.step > config.steps {
             return Err(mismatch(format!(
@@ -300,6 +382,10 @@ impl Trainer {
                 Optimizer::SignTrust(optimizer)
             }
         };
+        let (id_cursor, en_cursor, id_share) = match meta.mixture_state {
+            Some(state) => (state.id_cursor, state.en_cursor, state.id_share),
+            None => (0, 0, config.mixture_target_id.unwrap_or(0.0)),
+        };
         Ok(Self {
             eval_rows: config.eval_rows.min(val.count()),
             config,
@@ -313,6 +399,16 @@ impl Trainer {
             batch_cursor: meta.batch_cursor,
             loss_history: meta.loss_history,
             eval_history: meta.eval_history,
+            train_langs: None,
+            val_langs: None,
+            id_rows: Vec::new(),
+            en_rows: Vec::new(),
+            val_id_rows: Vec::new(),
+            val_en_rows: Vec::new(),
+            id_cursor,
+            en_cursor,
+            id_share,
+            mixture_history: meta.mixture_history,
         })
     }
 
@@ -345,12 +441,18 @@ impl Trainer {
     /// One K4 step: constant token budget, forward, backward, optimizer
     /// update, loss recorded; evaluates when the schedule says so.
     pub fn train_step(&mut self) -> Result<f32, TrainerError> {
+        if self.config.mixture_target_id.is_some() && self.train_langs.is_none() {
+            return Err(TrainerError::ConfigInvalid {
+                reason: "mixture_target_id is set but language tags were never attached"
+                    .to_string(),
+            });
+        }
         let seq_len = self.config.model.seq_len;
         let count = self.train.count();
+        let rows = self.batch_rows();
         let mut tokens = Vec::with_capacity(self.batch_size * seq_len);
         let mut targets = Vec::with_capacity(self.batch_size * seq_len);
-        for offset in 0..self.batch_size {
-            let row = (self.batch_cursor + offset) % count;
+        for row in rows {
             let span = row * seq_len..(row + 1) * seq_len;
             tokens.extend_from_slice(&self.train.x()[span.clone()]);
             targets.extend_from_slice(&self.train.y()[span]);
@@ -384,12 +486,82 @@ impl Trainer {
 
         if self.config.eval_every > 0 && self.step % self.config.eval_every == 0 {
             let held_out = self.evaluate()?;
-            self.eval_history.push(EvalRecord {
+            let mut record = EvalRecord {
                 step: self.step,
                 loss: held_out,
-            });
+                loss_id: None,
+                loss_en: None,
+            };
+            if self.mixture_enabled() {
+                let id_loss = self.evaluate_language(&self.val_id_rows)?;
+                let en_loss = self.evaluate_language(&self.val_en_rows)?;
+                if let (Some(id_loss), Some(en_loss)) = (id_loss, en_loss) {
+                    let target = self.config.mixture_target_id.unwrap_or(0.5);
+                    let band = self.config.mixture_band;
+                    let adjusted = (target + (id_loss as f64 - en_loss as f64))
+                        .clamp(target - band, target + band);
+                    self.id_share = adjusted;
+                    self.mixture_history.push(MixtureRecord {
+                        step: self.step,
+                        id_share: adjusted,
+                        id_loss,
+                        en_loss,
+                    });
+                }
+                record.loss_id = id_loss;
+                record.loss_en = en_loss;
+            }
+            self.eval_history.push(record);
         }
         Ok(loss_value)
+    }
+
+    /// Whether the K5 id:en mixture is enabled and its pools are attached.
+    fn mixture_enabled(&self) -> bool {
+        self.config.mixture_target_id.is_some() && self.train_langs.is_some()
+    }
+
+    /// The train-window rows feeding this step: the natural K4 order, or the
+    /// K5 pool sampling at the current Indonesian share (id rows first, then
+    /// en rows; both pools cycle independently).
+    fn batch_rows(&mut self) -> Vec<usize> {
+        if !self.mixture_enabled() {
+            let count = self.train.count();
+            return (0..self.batch_size)
+                .map(|offset| (self.batch_cursor + offset) % count)
+                .collect();
+        }
+        let mut id_count = ((self.batch_size as f64) * self.id_share).round() as usize;
+        id_count = id_count.min(self.batch_size);
+        let mut rows = Vec::with_capacity(self.batch_size);
+        for _ in 0..id_count {
+            let row = self.id_rows[self.id_cursor % self.id_rows.len()];
+            rows.push(row);
+            self.id_cursor += 1;
+        }
+        for _ in 0..(self.batch_size - id_count) {
+            let row = self.en_rows[self.en_cursor % self.en_rows.len()];
+            rows.push(row);
+            self.en_cursor += 1;
+        }
+        rows
+    }
+
+    /// Mean held-out loss over the given val rows (up to `eval_rows`).
+    fn evaluate_language(&self, rows: &[usize]) -> Result<Option<f32>, TrainerError> {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let seq_len = self.config.model.seq_len;
+        let count = rows.len().min(self.eval_rows);
+        let mut tokens = Vec::with_capacity(count * seq_len);
+        let mut targets = Vec::with_capacity(count * seq_len);
+        for &row in &rows[..count] {
+            let span = row * seq_len..(row + 1) * seq_len;
+            tokens.extend_from_slice(&self.val.x()[span.clone()]);
+            targets.extend_from_slice(&self.val.y()[span]);
+        }
+        Ok(Some(self.forward_loss(&tokens, &targets)?))
     }
 
     /// Mean held-out loss over the first `eval_rows` val windows (no
@@ -459,6 +631,15 @@ impl Trainer {
                 })
                 .collect(),
         };
+        let mixture_state = if self.mixture_enabled() {
+            Some(MixtureState {
+                id_cursor: self.id_cursor,
+                en_cursor: self.en_cursor,
+                id_share: self.id_share,
+            })
+        } else {
+            None
+        };
         let meta = CheckpointMeta {
             format: FORMAT_ID.to_string(),
             config: self.config.clone(),
@@ -466,6 +647,8 @@ impl Trainer {
             batch_cursor: self.batch_cursor,
             loss_history: self.loss_history.clone(),
             eval_history: self.eval_history.clone(),
+            mixture_history: self.mixture_history.clone(),
+            mixture_state,
             params,
             optimizer,
         };
@@ -491,6 +674,20 @@ impl Trainer {
     /// Held-out evaluation history.
     pub fn eval_history(&self) -> &[EvalRecord] {
         &self.eval_history
+    }
+
+    /// Every recorded K5 mixture adjustment (empty when the mixture is off).
+    pub fn mixture_history(&self) -> &[MixtureRecord] {
+        &self.mixture_history
+    }
+
+    /// The Indonesian window share currently in effect (K5; 0 when off).
+    pub fn id_share(&self) -> f64 {
+        if self.mixture_enabled() {
+            self.id_share
+        } else {
+            0.0
+        }
     }
 
     /// The run configuration.

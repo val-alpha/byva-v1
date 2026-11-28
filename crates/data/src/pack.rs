@@ -3,6 +3,7 @@
 //! exactly so R4 parity compares like with like).
 
 use crate::error::DataError;
+use crate::lang::{DocLang, Lang, window_langs};
 
 /// One split's packed windows, stored flat: row `i` is
 /// `x[i*seq_len..(i+1)*seq_len]` with its targets at the same offset in `y`.
@@ -77,6 +78,44 @@ pub fn pack(tokens: &[u32], seq_len: usize) -> Result<Packed, DataError> {
     Ok(Packed {
         train: Sequences::from_windows(&windows[..split], seq_len),
         val: Sequences::from_windows(&windows[split..], seq_len),
+    })
+}
+
+/// A packed dataset with one language tag per window (K5 id:en mixture).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedPacked {
+    /// Same 90/10 split as `pack`.
+    pub packed: Packed,
+    /// Window languages of the training split, in window order.
+    pub train_langs: Vec<Lang>,
+    /// Window languages of the held-out split, in window order.
+    pub val_langs: Vec<Lang>,
+}
+
+/// Packs one long token stream exactly like `pack` and additionally tags
+/// every window with the majority language of the documents covering its
+/// tokens (K5). Window order, window contents, and the split boundary are
+/// identical to `pack`.
+pub fn pack_with_languages(
+    tokens: &[u32],
+    docs: &[DocLang],
+    seq_len: usize,
+) -> Result<TaggedPacked, DataError> {
+    let packed = pack(tokens, seq_len)?;
+    let (langs, split) = window_langs(tokens.len(), docs, seq_len);
+    if langs.len() < packed.train().count() + packed.val().count() {
+        return Err(DataError::PackingInvalid {
+            reason: format!(
+                "document language ranges cover {} windows but packing produced {}",
+                langs.len(),
+                packed.train().count() + packed.val().count()
+            ),
+        });
+    }
+    Ok(TaggedPacked {
+        train_langs: langs[..split].to_vec(),
+        val_langs: langs[split..].to_vec(),
+        packed,
     })
 }
 

@@ -138,6 +138,13 @@ pub struct TrainConfig {
     /// Number of held-out rows per evaluation (capped by availability).
     #[serde(default = "default_eval_rows")]
     pub eval_rows: usize,
+    /// K5 mixture target share of Indonesian windows (None keeps the natural
+    /// corpus order; set to enable the id:en mixture).
+    #[serde(default)]
+    pub mixture_target_id: Option<f64>,
+    /// K5 adaptation band around the target share.
+    #[serde(default = "default_mixture_band")]
+    pub mixture_band: f64,
 }
 
 fn default_learning_rate() -> f64 {
@@ -178,6 +185,10 @@ fn default_eval_every() -> u64 {
 
 fn default_eval_rows() -> usize {
     200
+}
+
+fn default_mixture_band() -> f64 {
+    0.1
 }
 
 impl TrainConfig {
@@ -237,6 +248,23 @@ impl TrainConfig {
         }
         if self.eval_rows == 0 {
             return Err(invalid("eval_rows must be positive".to_string()));
+        }
+        if let Some(target) = self.mixture_target_id {
+            if !(0.0 < target && target < 1.0) {
+                return Err(invalid(format!(
+                    "mixture_target_id must be in (0, 1), found {}",
+                    target
+                )));
+            }
+            if self.mixture_band < 0.0
+                || target - self.mixture_band <= 0.0
+                || target + self.mixture_band >= 1.0
+            {
+                return Err(invalid(format!(
+                    "mixture_band must keep target {} inside (0, 1), found {}",
+                    target, self.mixture_band
+                )));
+            }
         }
         Ok(())
     }

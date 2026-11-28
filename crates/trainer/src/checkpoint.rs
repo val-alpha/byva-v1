@@ -37,6 +37,36 @@ pub struct EvalRecord {
     pub step: u64,
     /// Mean held-out cross-entropy loss.
     pub loss: f32,
+    /// Held-out loss over Indonesian windows (mixture runs only).
+    #[serde(default)]
+    pub loss_id: Option<f32>,
+    /// Held-out loss over English windows (mixture runs only).
+    #[serde(default)]
+    pub loss_en: Option<f32>,
+}
+
+/// One recorded K5 mixture adjustment (eval-driven, bounded by the band).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MixtureRecord {
+    /// Step at which the adjustment was recorded.
+    pub step: u64,
+    /// The Indonesian window share applied from the next step on.
+    pub id_share: f64,
+    /// Held-out loss that drove the adjustment (Indonesian).
+    pub id_loss: f32,
+    /// Held-out loss that drove the adjustment (English).
+    pub en_loss: f32,
+}
+
+/// Resumable K5 mixture state (None when the mixture is off).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MixtureState {
+    /// Cycling cursor into the Indonesian train-window pool.
+    pub id_cursor: usize,
+    /// Cycling cursor into the English train-window pool.
+    pub en_cursor: usize,
+    /// The Indonesian window share in effect.
+    pub id_share: f64,
 }
 
 /// Optimizer state description in a checkpoint.
@@ -63,6 +93,12 @@ pub struct CheckpointMeta {
     pub loss_history: Vec<f32>,
     /// Held-out evaluation history.
     pub eval_history: Vec<EvalRecord>,
+    /// Every recorded K5 mixture adjustment (empty when the mixture is off).
+    #[serde(default)]
+    pub mixture_history: Vec<MixtureRecord>,
+    /// Resumable K5 mixture state (None when the mixture is off).
+    #[serde(default)]
+    pub mixture_state: Option<MixtureState>,
     /// Parameter blob descriptions in canonical order.
     pub params: Vec<TensorDesc>,
     /// Optimizer state description.

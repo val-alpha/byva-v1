@@ -39,6 +39,8 @@ pub fn config(optimizer: OptimizerKind, steps: u64) -> TrainConfig {
         floor_ratio: 0.1,
         eval_every: 2,
         eval_rows: 2,
+        mixture_target_id: None,
+        mixture_band: 0.1,
     }
 }
 
