@@ -51,6 +51,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "byva-autodiff"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "byva-cli"
 version = "0.1.0"
 dependencies = [
@@ -66,6 +73,13 @@ version = "0.1.0"
 dependencies = [
  "byva-model",
  "byva-runtime",
+ "thiserror",
+]
+
+[[package]]
+name = "byva-data"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 
@@ -103,6 +117,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "byva-tensor"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "byva-tokenizer"
 version = "0.1.0"
 dependencies = [
@@ -112,6 +133,13 @@ dependencies = [
  "serde_json",
  "thiserror",
  "unicode-normalization",
+]
+
+[[package]]
+name = "byva-trainer"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

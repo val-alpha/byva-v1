@@ -1,0 +1,13 @@
+[package]
+name = "byva-data"
+version = "0.1.0"
+description = "BYVA shard reader, manifest validation, and token packing"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

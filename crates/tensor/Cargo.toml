@@ -1,0 +1,13 @@
+[package]
+name = "byva-tensor"
+version = "0.1.0"
+description = "BYVA dense fp32 tensor storage with checked shape arithmetic"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

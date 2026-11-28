@@ -1,0 +1,13 @@
+[package]
+name = "byva-autodiff"
+version = "0.1.0"
+description = "BYVA reverse-mode autodiff tape for the Rust training path"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

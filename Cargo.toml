@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/tokenizer", "crates/format", "crates/model", "crates/runtime", "crates/convert", "crates/cli"]
+members = ["crates/tokenizer", "crates/format", "crates/model", "crates/runtime", "crates/convert", "crates/tensor", "crates/autodiff", "crates/data", "crates/trainer", "crates/cli"]
 default-members = ["crates/cli"]
 
 [workspace.package]

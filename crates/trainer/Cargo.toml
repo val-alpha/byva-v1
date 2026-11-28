@@ -1,0 +1,13 @@
+[package]
+name = "byva-trainer"
+version = "0.1.0"
+description = "BYVA pure-Rust training loop (method ne2410)"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true
