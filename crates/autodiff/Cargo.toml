@@ -7,7 +7,11 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+byva-tensor = { path = "../tensor" }
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1.6"
 
 [lints]
 workspace = true

@@ -132,6 +132,11 @@ Workspace dependencies stay minimal: `serde`/`serde_json` (manifests, checkpoint
 | R6 | K5 inline loss-aware mixture (bounded, manifest-recorded) | per-run manifest records every adjustment; quality delta reported |
 | R7 | Optional GPU backend (wgpu or cudarc) | only if hardware is available; otherwise recorded **not run** |
 
+Milestone status:
+
+- **R0 — done** (2026-11-28): D-0022 accepted; `byva-tensor`, `byva-autodiff`, `byva-data`, `byva-trainer` scaffolded as workspace members; `byva-tensor` ships checked fp32 dense storage with 8 unit tests; workspace checks green.
+- **R1 — done** (2026-11-28): reverse-mode tape engine in `byva-autodiff` — all D-0013 ops (matmul, elementwise add/mul, broadcast position rows, scalar mul, reshape, embedding scatter-add, column slicing, head reordering, batched Q·Kᵀ and probs·V, causal-prefix softmax, f64-stat pre-norm layernorm, exact-erf GELU) plus the tied-logit-free cross-entropy (K2: logits computed row by row, the full `[n, vocab]` logits matrix is never materialized) and the two D-0022 optimizers (AdamW default, SignTrust behind config, deterministic, no RNG). Gate passed: finite-difference gradcheck property tests cover every op and a full attention-block end-to-end graph (`crates/autodiff/tests/gradcheck.rs`), plus hand-computed cases and typed-error tests.
+
 This path serves the Phase 3 pretraining gate; note the Phase 3 gate text says "Real T4 training run". If the accepted route becomes local CPU training, that wording needs a documented, approved gate exception (D-0008) rather than a silent reinterpretation.
 
 ## Risks and mitigations
