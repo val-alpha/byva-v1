@@ -1,0 +1,17 @@
+[package]
+name = "byva-trainer"
+version = "0.1.0"
+description = "BYVA pure-Rust training loop (method ne2410)"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+byva-autodiff = { path = "../autodiff" }
+byva-data = { path = "../data" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

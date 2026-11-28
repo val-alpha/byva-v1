@@ -4,6 +4,12 @@ BYVA is an experimental language model project built from random initialization,
 
 > Project status: Phase 3 implementation complete (decoder-only architecture + resumable reference trainer, gate in docs/PHASE3_REPORT.md). The Colab T4 training run is the remaining Phase 3/8 hardware task. No model has been pretrained at production scale yet and no inference backend has been validated.
 
+## Inspiration
+
+BYVA (byv) was created by [@val-alpha](https://github.com/val-alpha) and draws its inspiration from two songs from *La La Land* (2016): **"Mia & Sebastian's Theme"** and **"City of Stars"**. Both are about dreams and the future — chasing something you believe in before anyone else sees it, and paying for that dream with patience, persistence, and a little recklessness.
+
+This project carries that spirit into engineering: build the thing from scratch, from random initialization, step by gated step, even when the target feels far away — the way Sebastian keeps playing, and the way "City of Stars" asks whether the dream is worth it and answers by singing anyway.
+
 ## Project constraints
 
 - Pretraining starts from randomly initialized parameters. No third-party model checkpoints or weights are used.
