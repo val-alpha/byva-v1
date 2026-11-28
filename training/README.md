@@ -29,15 +29,33 @@ Output is `shard-00000.jsonl ...` plus `manifest.json` in `--output-dir`.
   manifests are portable), per-shard sha256 and byte counts, filter config,
   normalization, sort key, and run stats.
 
+## BPE tokenizer training
+
+```bash
+python3 training/train_bpe.py --shards shards/ \
+  --vocab-size 32768 \
+  --output artifacts/tokenizer/byva-tokenizer-v1.json \
+  --manifest artifacts/tokenizer/byva-tokenizer-v1.manifest.json
+```
+
+`train_bpe.py` is pure stdlib and deterministic: documents are pre-tokenized
+with a fixed Unicode-class regex, reduced to sorted word-type frequencies, and
+merges are selected greedily with (count desc, left id asc, right id asc)
+tie-breaking, so a given document set yields a byte-identical artifact. The
+artifact loads directly into the Rust `byva_tokenizer::Tokenizer` (D-0017).
+
 ## Tests
 
 ```bash
 python3 -m unittest discover -s training/tests -v
 ```
 
-Six tests cover filtering/dedup, order independence, exact-once sharding,
-manifest-to-shard checksum agreement, malformed-record rejection, and a frozen
-fixture regression (`training/fixtures/smoke/`).
+The pipeline tests cover filtering/dedup, order independence, exact-once
+sharding, manifest-to-shard checksum agreement, malformed-record rejection,
+and a frozen fixture regression (`training/fixtures/smoke/`). The BPE tests
+(`test_bpe.py`) cover artifact shape, order independence, merge tie-breaking,
+round trips, a frozen mini fixture (`training/fixtures/bpe/`), and the
+committed 32k artifact.
 
 ## Policy
 

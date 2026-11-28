@@ -113,3 +113,29 @@ Add dated entries for material decisions. Record superseded decisions rather tha
 - Decision: BYVA is trained as a bilingual Indonesian/English model. Only per-language configs of verified sources are admitted (c4 `id`, wikipedia `20231101.id`/`20231101.en`, OSCAR-2301 `id`/`en`, FineWeb/FineWeb-Edu English, TinyStories English). Multilingual dumps are consumed exclusively through their id/en subsets, and no other language enters pretraining.
 - Rationale: A small (~42M) model has limited capacity; concentrating it on two languages maximizes measured quality, Indonesian is the project's primary audience, and English data provides the strongest public capability signal that transfers.
 - Consequences: Mixture weights (id:en ratio) are decided per training run and recorded in the run manifest; added sources must fit the two-language scope or be rejected. OSCAR-2301 sampling is blocked on Hub authentication (HTTP 401) and stays pending until an HF token is provided.
+
+## D-0017 — Deterministic BPE training and artifact storage
+
+- Status: Accepted
+- Date: 2026-11-28
+- Decision: The tokenizer vocabulary is trained by `training/train_bpe.py` on
+  Phase 2 shards. Documents are pre-tokenized with a fixed Unicode-class regex
+  (letter runs, digit runs, whitespace runs, single other characters), reduced
+  to sorted word-type frequencies, and merges are selected greedily with
+  tie-breaking (highest pair count, then lowest left token id, then lowest
+  right token id), so a given document set yields a byte-identical artifact.
+  The trained 32,768-vocab artifact and its training manifest are committed
+  under `artifacts/tokenizer/` as source-derived data — not a corpus,
+  checkpoint, or model binary.
+- Rationale: D-0015 requires a trained 32k BPE table before production
+  pretraining. The training corpus is a datasets-server sample that can drift
+  between retrievals, so byte-identical regeneration cannot be guaranteed;
+  committing the small JSON artifact and validating it in Rust CI keeps the
+  production vocabulary stable and auditable.
+- Consequences: `crates/tokenizer/tests/bpe_artifact.rs` loads the committed
+  artifact and would fail on drift. Any retraining (e.g., on full-corpus
+  shards during the Colab scale-up) must record a new training manifest and
+  either supersede the artifact under a new version/name or reproduce the
+  existing one exactly. `training/train.py` still encodes byte ids until it
+  gains `--tokenizer` support, after which production pretraining consumes
+  only the trained artifact (D-0015).
